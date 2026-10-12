@@ -1363,13 +1363,12 @@ impl ArchiveReader {
         let source = crate::source::ArchiveSource::Reader(reader.clone());
         let len = source.len()?;
         let mut cursor = reader.cursor();
-        let mut scan = vec![0; len.min(SFX_SCAN_LIMIT)];
-        crate::read_control::ReadControl::new(options.cancellation)
-            .reader(&mut cursor)
-            .read_exact(&mut scan)?;
+        let signature = read_archive_signature(
+            &mut crate::read_control::ReadControl::new(options.cancellation).reader(&mut cursor),
+            len.min(SFX_SCAN_LIMIT),
+        )?;
         options.check_cancelled()?;
-        let signature =
-            find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        let signature = signature.ok_or(Error::UnsupportedSignature)?;
         match signature.family {
             ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_seekable(
                 cursor,
@@ -1404,11 +1403,9 @@ impl ArchiveReader {
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let mut scan = vec![0; len.min(SFX_SCAN_LIMIT as u64) as usize];
-        file.read_exact(&mut scan)?;
+        let signature = read_archive_signature(&mut file, len.min(SFX_SCAN_LIMIT as u64) as usize)?;
         options.check_cancelled()?;
-        let signature =
-            find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        let signature = signature.ok_or(Error::UnsupportedSignature)?;
         match signature.family {
             ArchiveFamily::Rar13 => Ok(Archive::Rar13(
                 rar13::Archive::parse_path_with_signature_and_options(path, signature, options)?,
@@ -1422,6 +1419,33 @@ impl ArchiveReader {
         }
     }
 }
+
+fn read_archive_signature(
+    reader: &mut impl Read,
+    scan_len: usize,
+) -> Result<Option<ArchiveSignature>> {
+    let mut prefix = [0; 8];
+    let prefix_len = scan_len.min(prefix.len());
+    reader.read_exact(&mut prefix[..prefix_len])?;
+    if let Some(signature) = detect_archive_family(&prefix[..prefix_len])
+        .filter(|signature| signature.family != ArchiveFamily::Rar13)
+    {
+        // The first strong signature wins the full scan too. RAR 1.3 still
+        // scans because a later RAR 1.5/5 signature takes precedence over it.
+        return Ok(Some(signature));
+    }
+    if scan_len <= prefix.len() {
+        return Ok(find_archive_start(&prefix[..prefix_len], SFX_SCAN_LIMIT));
+    }
+    let mut scan = vec![0; scan_len];
+    scan[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+    reader.read_exact(&mut scan[prefix_len..])?;
+    Ok(find_archive_start(&scan, SFX_SCAN_LIMIT))
+}
+
+#[cfg(test)]
+#[path = "reader_signature_tests.rs"]
+mod reader_signature_tests;
 
 fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
     match password {

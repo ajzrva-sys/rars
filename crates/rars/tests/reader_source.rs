@@ -136,6 +136,12 @@ fn parsing_skips_large_payloads_and_keeps_the_source_for_later_reads() {
         let fail = source.fail.clone();
         let archive = ArchiveReader::read_reader(source).unwrap();
         assert!(reads.load(Ordering::Relaxed) < data.len());
+        if version != ArchiveVersion::Rar14 {
+            assert!(
+                reads.load(Ordering::Relaxed) < 1024,
+                "standard strong-signature parsing reads headers, not the payload scan"
+            );
+        }
         assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), data);
         fail.store(true, Ordering::Relaxed);
         let error = archive
