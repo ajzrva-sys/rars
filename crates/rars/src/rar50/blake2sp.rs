@@ -195,6 +195,21 @@ impl Hasher {
     }
 
     fn update_group(&mut self, group: &[u8]) {
+        // Keep each leaf's final block pending, just as Blake2s::update does.
+        // A new full stripe proves the previous stripe is not final, so its
+        // eight independent compression states can run together.
+        if self.leaves[0].buflen == BLOCK_BYTES {
+            debug_assert!(self.leaves.iter().all(|leaf| leaf.buflen == BLOCK_BYTES));
+            self.compress_leaf_group();
+            for (leaf, block) in self
+                .leaves
+                .iter_mut()
+                .zip(group.as_chunks::<BLOCK_BYTES>().0.iter())
+            {
+                leaf.buf.copy_from_slice(block);
+            }
+            return;
+        }
         for (leaf, block) in self
             .leaves
             .iter_mut()
@@ -202,6 +217,62 @@ impl Hasher {
         {
             leaf.update(block);
         }
+    }
+
+    fn compress_leaf_group(&mut self) {
+        // Word-major lanes expose independent leaf work to the optimizer
+        // without CPU-specific intrinsics or changing the persistent state.
+        let mut message = [[0u32; PARALLELISM]; 16];
+        let mut state = [[0u32; PARALLELISM]; 16];
+        for (lane, leaf) in self.leaves.iter_mut().enumerate() {
+            leaf.t = leaf.t.wrapping_add(BLOCK_BYTES as u64);
+            for (word, bytes) in leaf.buf.as_chunks::<4>().0.iter().enumerate() {
+                message[word][lane] = u32::from_le_bytes(*bytes);
+            }
+            for word in 0..8 {
+                state[word][lane] = leaf.h[word];
+                state[word + 8][lane] = IV[word];
+            }
+            state[12][lane] ^= leaf.t as u32;
+            state[13][lane] ^= (leaf.t >> 32) as u32;
+        }
+        for schedule in SIGMA {
+            g_lanes::<0, 4, 8, 12>(&mut state, &message[schedule[0]], &message[schedule[1]]);
+            g_lanes::<1, 5, 9, 13>(&mut state, &message[schedule[2]], &message[schedule[3]]);
+            g_lanes::<2, 6, 10, 14>(&mut state, &message[schedule[4]], &message[schedule[5]]);
+            g_lanes::<3, 7, 11, 15>(&mut state, &message[schedule[6]], &message[schedule[7]]);
+            g_lanes::<0, 5, 10, 15>(&mut state, &message[schedule[8]], &message[schedule[9]]);
+            g_lanes::<1, 6, 11, 12>(&mut state, &message[schedule[10]], &message[schedule[11]]);
+            g_lanes::<2, 7, 8, 13>(&mut state, &message[schedule[12]], &message[schedule[13]]);
+            g_lanes::<3, 4, 9, 14>(&mut state, &message[schedule[14]], &message[schedule[15]]);
+        }
+        for (lane, leaf) in self.leaves.iter_mut().enumerate() {
+            for word in 0..8 {
+                leaf.h[word] ^= state[word][lane] ^ state[word + 8][lane];
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn g_lanes<const A: usize, const B: usize, const C: usize, const D: usize>(
+    state: &mut [[u32; PARALLELISM]; 16],
+    x: &[u32; PARALLELISM],
+    y: &[u32; PARALLELISM],
+) {
+    for lane in 0..PARALLELISM {
+        state[A][lane] = state[A][lane]
+            .wrapping_add(state[B][lane])
+            .wrapping_add(x[lane]);
+        state[D][lane] = (state[D][lane] ^ state[A][lane]).rotate_right(16);
+        state[C][lane] = state[C][lane].wrapping_add(state[D][lane]);
+        state[B][lane] = (state[B][lane] ^ state[C][lane]).rotate_right(12);
+        state[A][lane] = state[A][lane]
+            .wrapping_add(state[B][lane])
+            .wrapping_add(y[lane]);
+        state[D][lane] = (state[D][lane] ^ state[A][lane]).rotate_right(8);
+        state[C][lane] = state[C][lane].wrapping_add(state[D][lane]);
+        state[B][lane] = (state[B][lane] ^ state[C][lane]).rotate_right(7);
     }
 }
 
@@ -224,7 +295,7 @@ fn g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) 
 
 #[cfg(test)]
 mod tests {
-    use super::{hash, Hasher};
+    use super::{hash, Blake2s, Hasher, BLOCK_BYTES, PARALLELISM};
 
     #[test]
     fn matches_public_blake2sp_vectors() {
@@ -321,6 +392,117 @@ mod tests {
             hasher.update(chunk);
         }
         assert_eq!(hasher.finalize(), hash(&input));
+    }
+
+    #[test]
+    fn batched_stripes_match_independent_long_tree_hash_vectors() {
+        // Same independent hashlib tree parameters as the boundary vectors,
+        // with enough complete stripes to repeatedly enter the batched path.
+        for (length, expected) in [
+            (
+                65_535,
+                "ab141a58697b388f28149af484e466beea9f28dbd5aed8e649f02fa8d0afcb0d",
+            ),
+            (
+                65_536,
+                "f31ebaad05d2ead9e476110facfaaf38141a58d53da972a09be1d9e22e0a94ad",
+            ),
+            (
+                65_537,
+                "60e42e849f6f22218ae9faeb17cf9eaf00fd9bc140a4b392109d6378557a4192",
+            ),
+            (
+                1_048_576,
+                "65f05ea2b52b252474eadbcc69d159009c3b7b98e2c630a3056561269d78656e",
+            ),
+        ] {
+            let input: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+            assert_eq!(hex(&hash(&input)), expected, "length={length}");
+            for chunk_size in [63, 64, 65, 511, 512, 513, 4097, 65_536] {
+                let mut hasher = Hasher::new();
+                for chunk in input.chunks(chunk_size) {
+                    hasher.update(chunk);
+                }
+                assert_eq!(
+                    hex(&hasher.finalize()),
+                    expected,
+                    "length={length}, chunk={chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_updates_match_scalar_leaves_for_varied_data_and_tails() {
+        let mut random = 0x1234_5678u32;
+        let input: Vec<_> = (0..65_537)
+            .map(|_| {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (random >> 24) as u8
+            })
+            .collect();
+        for length in [
+            0, 1, 63, 64, 65, 511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097, 65_535, 65_536,
+            65_537,
+        ] {
+            let data = &input[..length];
+            let mut leaves: [Blake2s; PARALLELISM] =
+                std::array::from_fn(|lane| Blake2s::new(lane as u64, 0, lane == PARALLELISM - 1));
+            for (block_index, block) in data.chunks(BLOCK_BYTES).enumerate() {
+                leaves[block_index % PARALLELISM].update(block);
+            }
+            let mut root = Blake2s::new(0, 1, true);
+            for leaf in leaves {
+                root.update(&leaf.finalize());
+            }
+            let expected = root.finalize();
+            assert_eq!(hash(data), expected, "length={length}");
+            for chunk_size in [1, 67, 511, 512, 513, 4097] {
+                let mut hasher = Hasher::new();
+                for chunk in data.chunks(chunk_size) {
+                    hasher.update(chunk);
+                }
+                assert_eq!(
+                    hasher.finalize(),
+                    expected,
+                    "length={length}, chunk={chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_compression_keeps_each_leaf_counter_and_wrapping_arithmetic() {
+        for counter in [0, 1, u64::MAX - 64, u64::MAX - 63, u64::MAX - 32] {
+            let prepare = || {
+                let mut hasher = Hasher::new();
+                for (lane, leaf) in hasher.leaves.iter_mut().enumerate() {
+                    leaf.t = counter.wrapping_add(lane as u64);
+                    leaf.buflen = BLOCK_BYTES;
+                    for (byte_index, byte) in leaf.buf.iter_mut().enumerate() {
+                        *byte = (byte_index * 17 + lane * 41) as u8;
+                    }
+                    for (word, value) in leaf.h.iter_mut().enumerate() {
+                        *value ^= u32::MAX.wrapping_sub((word * 17 + lane * 41) as u32);
+                    }
+                }
+                hasher
+            };
+            let mut actual = prepare();
+            let mut expected = prepare();
+            actual.compress_leaf_group();
+            for leaf in &mut expected.leaves {
+                leaf.t = leaf.t.wrapping_add(BLOCK_BYTES as u64);
+                let block = leaf.buf;
+                leaf.compress(&block, false);
+            }
+            for (actual, expected) in actual.leaves.iter().zip(expected.leaves) {
+                assert_eq!(actual.h, expected.h);
+                assert_eq!(actual.t, expected.t);
+                assert_eq!(actual.buf, expected.buf);
+                assert_eq!(actual.buflen, expected.buflen);
+            }
+        }
     }
 
     fn hex(bytes: &[u8]) -> String {

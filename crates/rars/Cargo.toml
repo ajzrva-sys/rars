@@ -77,3 +77,8 @@ harness = false
 name = "streaming_decode"
 harness = false
 required-features = ["write"]
+
+[[bench]]
+name = "rar50_hash"
+harness = false
+required-features = ["write"]
