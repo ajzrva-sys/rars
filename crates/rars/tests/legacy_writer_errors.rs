@@ -8,7 +8,7 @@ use rars::{
 #[path = "support/scratch.rs"]
 mod scratch;
 use std::{
-    io::{self, Cursor, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -619,21 +619,169 @@ fn changed_contents_and_lengths_have_the_same_source_changed_category() {
 #[test]
 fn builder_source_materialization_identifies_the_member() {
     for format in FORMATS {
+        for (store, solid) in [(true, false), (false, false), (false, true)] {
+            for actual_length in [1, 4] {
+                let mut builder = Builder::new(format).store(store).solid(solid);
+                builder
+                    .add_source(
+                        b"source".to_vec(),
+                        EntrySource::from_opener(3, move || {
+                            Ok(Box::new(Cursor::new(vec![1; actual_length])))
+                        }),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                for error in builder_errors(&builder) {
+                    assert_eq!(error.kind(), ErrorKind::SourceChanged, "{format:?}");
+                    assert_eq!(
+                        error.entry_context(),
+                        Some((&b"source"[..], "reading source"))
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn builder_errors(builder: &Builder) -> [Error; 3] {
+    let resources = WriterResources::default();
+    [
+        builder.to_bytes().unwrap_err(),
+        builder
+            .to_bytes_with_resources(&resources, None)
+            .unwrap_err(),
+        builder
+            .write_to(&mut Vec::new(), &resources, None)
+            .unwrap_err(),
+    ]
+}
+
+fn write_stored_source(
+    format: ArchiveVersion,
+    source: EntrySource,
+    resources: &WriterResources,
+    output: &mut dyn Write,
+    through_builder: bool,
+) -> rars::Result<()> {
+    if through_builder {
+        let mut builder = Builder::new(format).store(true);
+        builder.add_source(b"second".to_vec(), source, None, None)?;
+        builder.write_to(output, resources, None)
+    } else {
+        write(format, source, false, false, resources, output)
+    }
+}
+
+#[test]
+fn builder_source_io_failures_keep_reading_context() {
+    struct FailingRead {
+        cursor: Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+    impl Read for FailingRead {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.cursor.position() >= self.fail_at {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "source read denied",
+                ))
+            } else {
+                self.cursor.read(output)
+            }
+        }
+    }
+    impl Seek for FailingRead {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
+    let root = scratch::case("builder-source-io-context");
+    for format in FORMATS {
+        for (store, solid) in [(true, false), (false, false), (false, true)] {
+            // A path has a fallible length lookup. The other cases fail while
+            // opening, consuming advertised bytes, or probing for extra bytes.
+            for failure in 0..4 {
+                let source = match failure {
+                    0 => EntrySource::from_path(root.join("absent")),
+                    1 => EntrySource::from_opener(4, || {
+                        Err(
+                            io::Error::new(io::ErrorKind::PermissionDenied, "source open denied")
+                                .into(),
+                        )
+                    }),
+                    _ => EntrySource::from_opener(4, move || {
+                        Ok(Box::new(FailingRead {
+                            cursor: Cursor::new(b"good".to_vec()),
+                            fail_at: if failure == 2 { 0 } else { 4 },
+                        }))
+                    }),
+                };
+                let mut builder = Builder::new(format).store(store).solid(solid);
+                let name = b"source-\xff";
+                builder
+                    .add_source(name.to_vec(), source, None, None)
+                    .unwrap();
+                for error in builder_errors(&builder) {
+                    assert_eq!(error.kind(), ErrorKind::Io, "{format:?}: {failure}");
+                    assert_eq!(
+                        error.entry_context(),
+                        Some((name.as_slice(), "reading source"))
+                    );
+                    assert!(matches!(error.root_cause(), Error::Io(io)
+                        if io.kind == if failure == 0 { io::ErrorKind::NotFound } else { io::ErrorKind::PermissionDenied }));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn builder_source_context_preserves_existing_errors_and_cancellation() {
+    for format in FORMATS {
+        for store in [false, true] {
+            for original in [
+                Error::SourceChanged("upstream read failed")
+                    .at_entry(b"upstream".to_vec(), "opening"),
+                Error::Cancelled,
+            ] {
+                let mut builder = Builder::new(format).store(store);
+                builder
+                    .add_source(
+                        b"source".to_vec(),
+                        EntrySource::from_opener(4, {
+                            let original = original.clone();
+                            move || Err(original.clone())
+                        }),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                for error in builder_errors(&builder) {
+                    assert_eq!(error, original);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn builder_member_validation_keeps_preparation_context() {
+    for format in [ArchiveVersion::Rar13, ArchiveVersion::Rar14] {
+        let name = vec![b'a'; 256];
         let mut builder = Builder::new(format);
         builder
             .add_source(
-                b"source".to_vec(),
-                EntrySource::from_opener(3, || Ok(Box::new(Cursor::new(vec![1])))),
+                name.clone(),
+                EntrySource::from_opener(4, || panic!("invalid member must not read its source")),
                 None,
                 None,
             )
             .unwrap();
-        let error = builder.to_bytes().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::SourceChanged);
-        assert_eq!(
-            error.entry_context(),
-            Some((&b"source"[..], "reading source"))
-        );
+        for error in builder_errors(&builder) {
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+            assert_eq!(error.entry_context(), Some((name.as_slice(), "preparing")));
+        }
     }
 }
 
@@ -656,7 +804,10 @@ fn member_payload_output_failure_retains_io_kind_and_member() {
             Ok(())
         }
     }
-    for format in FORMATS {
+    for (format, through_builder) in FORMATS
+        .into_iter()
+        .flat_map(|format| [(format, false), (format, true)])
+    {
         let broken = Arc::new(AtomicBool::new(false));
         let source = EntrySource::from_opener(4, {
             let broken = broken.clone();
@@ -668,13 +819,12 @@ fn member_payload_output_failure_retains_io_kind_and_member() {
                 Ok(Box::new(Cursor::new(b"good".to_vec())))
             }
         });
-        let error = write(
+        let error = write_stored_source(
             format,
             source,
-            false,
-            false,
             &WriterResources::default(),
             &mut Output(broken),
+            through_builder,
         )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Io);
@@ -693,14 +843,16 @@ fn cancellation_and_shared_output_failures_do_not_blame_a_member() {
             Ok(())
         }
     }
-    for format in FORMATS {
-        let error = write(
+    for (format, through_builder) in FORMATS
+        .into_iter()
+        .flat_map(|format| [(format, false), (format, true)])
+    {
+        let error = write_stored_source(
             format,
             EntrySource::from_bytes(b"good".to_vec()),
-            false,
-            false,
             &WriterResources::default(),
             &mut BrokenOutput,
+            through_builder,
         )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Io);
@@ -714,13 +866,12 @@ fn cancellation_and_shared_output_failures_do_not_blame_a_member() {
                 Ok(Box::new(Cursor::new(b"good".to_vec())))
             }
         });
-        let error = write(
+        let error = write_stored_source(
             format,
             source,
-            false,
-            false,
             &WriterResources::default().with_cancellation(token),
             &mut Vec::new(),
+            through_builder,
         )
         .unwrap_err();
         assert_eq!(error, Error::Cancelled);

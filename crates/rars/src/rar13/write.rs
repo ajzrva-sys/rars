@@ -175,7 +175,7 @@ pub(crate) fn write_archive_with_sources(
         .map(|entry| {
             let mut member = Member::from_file(&entry.file);
             if let Some(source) = entry.source {
-                member.bytes = MemberBytes::Source(source);
+                member.bytes = MemberBytes::NamedSource(source, entry.file.name);
             }
             member
         })

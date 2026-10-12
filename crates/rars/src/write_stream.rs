@@ -33,13 +33,24 @@ const WALK_CHUNK: usize = 256 * 1024;
 pub(crate) enum MemberBytes<'a> {
     Borrowed(&'a [u8]),
     Source(&'a EntrySource),
+    /// Builder inputs retain their source-read context even when loading is
+    /// deferred into a writer's preparation phase.
+    NamedSource(&'a EntrySource, &'a [u8]),
 }
 
 impl<'a> MemberBytes<'a> {
     pub(crate) fn len(&self) -> Result<u64> {
-        match self {
+        let result = match self {
             Self::Borrowed(data) => Ok(data.len() as u64),
-            Self::Source(source) => source.len(),
+            Self::Source(source) | Self::NamedSource(source, _) => source.len(),
+        };
+        result.map_err(|error| self.source_error(error))
+    }
+
+    fn source_error(&self, error: Error) -> Error {
+        match self {
+            Self::NamedSource(_, name) => member_error(error, name, "reading source"),
+            _ => error,
         }
     }
 
@@ -65,10 +76,19 @@ impl<'a> MemberBytes<'a> {
         expected: u64,
         progress: Option<crate::write_progress::ProgressReporter<'_>>,
     ) -> Result<Cow<'_, [u8]>> {
+        self.load_exact(expected, progress)
+            .map_err(|error| self.source_error(error))
+    }
+
+    fn load_exact(
+        &self,
+        expected: u64,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+    ) -> Result<Cow<'_, [u8]>> {
         crate::write_progress::check_cancelled(progress)?;
         match self {
             Self::Borrowed(data) => Ok(Cow::Borrowed(data)),
-            Self::Source(source) => {
+            Self::Source(source) | Self::NamedSource(source, _) => {
                 let capacity = usize::try_from(expected).map_err(|_| {
                     Error::InvalidArgument("member is larger than this host can hold")
                 })?;
@@ -114,6 +134,16 @@ impl<'a> MemberBytes<'a> {
         &self,
         expected: u64,
         progress: Option<crate::write_progress::ProgressReporter<'_>>,
+        visit: impl FnMut(&[u8]),
+    ) -> Result<()> {
+        self.walk_exact(expected, progress, visit)
+            .map_err(|error| self.source_error(error))
+    }
+
+    fn walk_exact(
+        &self,
+        expected: u64,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
         mut visit: impl FnMut(&[u8]),
     ) -> Result<()> {
         crate::write_progress::check_cancelled(progress)?;
@@ -124,7 +154,7 @@ impl<'a> MemberBytes<'a> {
                     visit(chunk);
                 }
             }
-            Self::Source(source) => {
+            Self::Source(source) | Self::NamedSource(source, _) => {
                 crate::write_progress::check_cancelled(progress)?;
                 let mut reader = crate::write_progress::CancellableIo {
                     inner: source.open()?,
@@ -158,7 +188,7 @@ impl<'a> MemberBytes<'a> {
     pub(crate) fn source(&self) -> Option<&'a EntrySource> {
         match self {
             Self::Borrowed(_) => None,
-            Self::Source(source) => Some(source),
+            Self::Source(source) | Self::NamedSource(source, _) => Some(source),
         }
     }
 
@@ -166,7 +196,7 @@ impl<'a> MemberBytes<'a> {
     /// reopen its session-owned staged payload. Public source factories keep
     /// their usual reopenable behavior.
     pub(crate) fn release(&self) {
-        if let Self::Source(source) = self {
+        if let Some(source) = self.source() {
             source.release();
         }
     }
