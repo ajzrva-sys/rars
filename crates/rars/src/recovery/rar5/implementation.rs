@@ -14,6 +14,63 @@ const RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE: u64 = 0x48;
 /// Resident parity a record rebuild may allocate. The archive itself is
 /// already in memory by the time a rebuild starts, so this bounds the extra.
 const MAX_REBUILD_PARITY_BYTES: u64 = 256 * 1024 * 1024;
+/// Conservative preflight ceiling on solve/reconstruction allocations and on
+/// resident rebuild workspace plus its intermediate record buffer. Input and
+/// parsed record storage, shared GF tables, final collected archive output,
+/// allocator overhead and control storage are outside this bound.
+const MAX_REPAIR_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn repair_workspace_sum(parts: &[u64]) -> Result<u64> {
+    parts.iter().try_fold(0u64, |total, &bytes| {
+        total.checked_add(bytes).ok_or(Error::PlanOverflow)
+    })
+}
+
+fn repair_workspace_product(count: u64, width: u64) -> Result<u64> {
+    count.checked_mul(width).ok_or(Error::PlanOverflow)
+}
+
+fn admit_repair_workspace(required: u64) -> Result<()> {
+    admit_repair_workspace_with_limit(required, MAX_REPAIR_WORKSPACE_BYTES)
+}
+
+fn admit_repair_workspace_with_limit(required: u64, limit: u64) -> Result<()> {
+    if required > limit {
+        return Err(Error::RepairWorkspaceLimitExceeded { limit, required });
+    }
+    Ok(())
+}
+
+/// Count a conservative sum, rather than requiring individual vectors to fit.
+/// Inversion holds the original equations, a working copy and the inverse at
+/// once. RHS rows, pivot copies and per-word scratch are counted too, together
+/// with returned shard buffers and their descriptors. Metadata is small but
+/// counted using the maximum growth of the damaged-index vector.
+fn repair_solve_workspace_required(
+    data_count: usize,
+    damaged_count: usize,
+    shard_len: usize,
+    output_bytes: u64,
+    read_scratch: usize,
+) -> Result<u64> {
+    let data_count = data_count as u64;
+    let damaged_count = damaged_count as u64;
+    let matrix_cells = repair_workspace_product(damaged_count, damaged_count)?;
+    let row_descriptors = (6 * std::mem::size_of::<Vec<u16>>()
+        + std::mem::size_of::<(std::ops::Range<usize>, Vec<u8>)>()
+        + 4 * std::mem::size_of::<u16>()) as u64;
+    let metadata = (std::mem::size_of::<Vec<u8>>()
+        + 2 * std::mem::size_of::<usize>()
+        + std::mem::size_of::<bool>()) as u64;
+    repair_workspace_sum(&[
+        repair_workspace_product(matrix_cells, 3 * std::mem::size_of::<u16>() as u64)?,
+        repair_workspace_product(damaged_count, shard_len as u64)?,
+        repair_workspace_product(damaged_count, row_descriptors)?,
+        repair_workspace_product(data_count, metadata)?,
+        output_bytes,
+        read_scratch as u64,
+    ])
+}
 
 use crate::progress::ProgressReporter;
 use crate::{WriteOperation, WriteProgressEvent};
@@ -904,6 +961,15 @@ pub(crate) fn repair_inline_recovery_prefix_with_control(
 /// `read_range` receives byte ranges relative to the protected prefix and must
 /// return the current bytes for each requested range. The returned pairs contain
 /// only the damaged prefix ranges that need to be written back.
+///
+/// A checked 256 MiB admission ceiling covers solve matrices and their working
+/// copies, row descriptors, RHS/pivot/read scratch and returned repaired shard
+/// buffers. Input and parsed recovery records, shared field tables, final
+/// collected archive output, allocator overhead and control storage are excluded.
+/// This is not a process-RAM limit. Oversized solves return
+/// [`Error::RepairWorkspaceLimitExceeded`] before allocating their matrices.
+/// Requested range scratch is admitted before discovery calls `read_range`;
+/// additional allocations made by the caller's callback are outside the ceiling.
 pub fn repair_inline_recovery_prefix_shards<F>(
     protected_size: usize,
     recovery_data: &[u8],
@@ -923,8 +989,27 @@ where
 pub(crate) fn repair_inline_recovery_prefix_shards_with_control<F>(
     protected_size: usize,
     recovery_data: &[u8],
+    read_range: F,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<(std::ops::Range<usize>, Vec<u8>)>>
+where
+    F: FnMut(std::ops::Range<usize>) -> Result<Vec<u8>>,
+{
+    repair_inline_recovery_prefix_shards_with_workspace_limit(
+        protected_size,
+        recovery_data,
+        read_range,
+        control,
+        MAX_REPAIR_WORKSPACE_BYTES,
+    )
+}
+
+fn repair_inline_recovery_prefix_shards_with_workspace_limit<F>(
+    protected_size: usize,
+    recovery_data: &[u8],
     mut read_range: F,
     control: &crate::read_control::ReadControl,
+    workspace_limit: u64,
 ) -> Result<Vec<(std::ops::Range<usize>, Vec<u8>)>>
 where
     F: FnMut(std::ops::Range<usize>) -> Result<Vec<u8>>,
@@ -947,6 +1032,19 @@ where
     let plan = first.plan;
     let shard_len = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
     let shard_ranges = split_prefix_shard_ranges(protected_size, plan)?;
+    // Admit the largest requested range before CRC discovery asks the caller
+    // to materialize it. Arbitrary additional callback allocations are outside
+    // our policy; the requested byte range is bounded here.
+    admit_repair_workspace_with_limit(
+        repair_solve_workspace_required(
+            shard_ranges.len(),
+            0,
+            shard_len,
+            0,
+            shard_len.min(protected_size),
+        )?,
+        workspace_limit,
+    )?;
     let mut damaged = Vec::new();
     for (index, range) in shard_ranges.iter().enumerate() {
         poller.check(0).map_err(|_| Error::Cancelled)?;
@@ -964,6 +1062,22 @@ where
     if damaged.len() > chunks.len() {
         return Err(Error::TooManyDamagedShards);
     }
+
+    let output_bytes = damaged.iter().try_fold(0u64, |bytes, &index| {
+        bytes
+            .checked_add(shard_ranges[index].len() as u64)
+            .ok_or(Error::PlanOverflow)
+    })?;
+    admit_repair_workspace_with_limit(
+        repair_solve_workspace_required(
+            shard_ranges.len(),
+            damaged.len(),
+            shard_len,
+            output_bytes,
+            shard_len.min(protected_size),
+        )?,
+        workspace_limit,
+    )?;
 
     let recovery_rows: Vec<_> = chunks[..damaged.len()]
         .iter()
@@ -1056,6 +1170,14 @@ pub(crate) struct InlineRepairOptions<'a> {
     pub record_range: Option<std::ops::Range<usize>>,
 }
 
+/// Repair an archive's protected prefix and, when possible, incomplete inline
+/// recovery records. Solves use the 256 MiB admission ceiling documented on
+/// [`repair_inline_recovery_prefix_shards`]. Record rebuilding checks a separate
+/// use of that ceiling for its full encoder matrix, resident parity, CRC/header
+/// and I/O scratch, row descriptors and growing intermediate framed-record
+/// buffer. Input/parsed records, shared field tables, final archive output and
+/// allocator/control overhead are excluded. If rebuilding is too large, the
+/// repaired prefix is returned while the incomplete recovery record is retained.
 pub fn repair_inline_recovery_archive(input: &[u8]) -> Result<Vec<u8>> {
     Ok(repair_inline_recovery_archive_with_report(input, &InlineRepairOptions::default())?.0)
 }
@@ -1180,10 +1302,11 @@ fn map_recovery_end_error(error: crate::Error) -> Error {
 /// Rebuilds the whole recovery record from the repaired prefix, replacing
 /// `record` in the archive.
 ///
-/// Parity is built resident, so a record declaring far more shards than it has
-/// bytes to protect could ask for an allocation nothing can serve. Refusing
-/// past [`MAX_REBUILD_PARITY_BYTES`] costs the caller the rebuild and keeps
-/// the data repair.
+/// Admission counts the full encoder matrix, resident parity and the framed
+/// record, including a growing Vec's old and replacement buffers. Limiting
+/// parity alone leaves repeated headers and coefficients unbounded when a
+/// small available chunk declares thousands of missing recovery rows.
+/// Refusal costs the caller the rebuild and keeps the data repair.
 fn rebuild_inline_recovery_record_with_control(
     input: &[u8],
     repaired_prefix: &[u8],
@@ -1199,6 +1322,19 @@ fn rebuild_inline_recovery_record_with_control(
     if parity_bytes > MAX_REBUILD_PARITY_BYTES {
         return Err(Error::RebuildTooLarge);
     }
+    let matrix_cells = repair_workspace_product(plan.data_shards, plan.recovery_shards)?;
+    let row_descriptors = 2 * std::mem::size_of::<Buffer<u8>>() as u64;
+    admit_repair_workspace(repair_workspace_sum(&[
+        repair_workspace_product(matrix_cells, std::mem::size_of::<u16>() as u64)?,
+        parity_bytes,
+        repair_workspace_product(plan.recovery_shards, row_descriptors)?,
+        repair_workspace_product(plan.data_shards, std::mem::size_of::<u64>() as u64)?,
+        // At most twice the framed record capacity plus its previous buffer
+        // while Vec growth replaces it. This is deliberately conservative.
+        repair_workspace_product(plan.payload_size()?, 3)?,
+        plan.group_count.max(1).min(RECOVERY_IO_BLOCK as u64),
+        plan.header_size,
+    ])?)?;
     let rebuilt = build_inline_recovery_data_for_plan_with_control(repaired_prefix, plan, control)?;
     if rebuilt.len() != record.len() {
         return Err(Error::BadRecoveryChunk);
@@ -1294,6 +1430,14 @@ fn append_inline_recovery_chunk(input: &[u8], found: &FoundInlineRecoveryChunk, 
     out.extend_from_slice(&input[start..end]);
 }
 
+/// Reconstruct equally padded data shards from available recovery rows.
+///
+/// Known shard lengths, missing-row availability and field dimensions are
+/// validated before output allocation. A checked 256 MiB admission ceiling
+/// covers padded output, solve matrices/copies and row/vector scratch. The
+/// caller's input, shared field tables, allocator and control overhead are
+/// excluded; this is not a process-RAM limit. Oversized reconstruction returns
+/// [`Error::RepairWorkspaceLimitExceeded`].
 pub fn reconstruct_data_shards(
     data_shards: &[Option<&[u8]>],
     recovery_shards: &[(usize, &[u8])],
@@ -1315,26 +1459,54 @@ pub fn reconstruct_data_shards(
     {
         return Err(Error::ShardSizeMismatch);
     }
+    if data_shards
+        .iter()
+        .flatten()
+        .any(|shard| shard.len() > shard_len)
+    {
+        return Err(Error::ShardSizeMismatch);
+    }
+    let missing_count = data_shards.iter().filter(|shard| shard.is_none()).count();
+    if missing_count > recovery_shards.len() {
+        return Err(Error::TooManyDamagedShards);
+    }
+    if data_shards.len() > FIELD_SIZE {
+        return Err(Error::TooManyShards);
+    }
+    // Unused recovery rows need no field coefficients. Validate each selected
+    // row without initializing the field or allocating any padded output.
+    if recovery_shards[..missing_count].iter().any(|&(row, _)| {
+        data_shards
+            .len()
+            .checked_add(row)
+            .is_none_or(|position| position >= FIELD_SIZE)
+    }) {
+        return Err(Error::TooManyShards);
+    }
+    let padded_bytes = repair_workspace_product(data_shards.len() as u64, shard_len as u64)?;
+    admit_repair_workspace(repair_solve_workspace_required(
+        data_shards.len(),
+        missing_count,
+        shard_len,
+        padded_bytes,
+        0,
+    )?)?;
 
+    let missing = data_shards
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shard)| shard.is_none().then_some(index))
+        .collect::<Vec<_>>();
     let mut out = Vec::with_capacity(data_shards.len());
-    let mut missing = Vec::new();
-    for (index, shard) in data_shards.iter().enumerate() {
+    for shard in data_shards {
         let mut padded = vec![0; shard_len];
         if let Some(shard) = shard {
-            if shard.len() > shard_len {
-                return Err(Error::ShardSizeMismatch);
-            }
             padded[..shard.len()].copy_from_slice(shard);
-        } else {
-            missing.push(index);
         }
         out.push(padded);
     }
     if missing.is_empty() {
         return Ok(out);
-    }
-    if missing.len() > recovery_shards.len() {
-        return Err(Error::TooManyDamagedShards);
     }
     recover_damaged_shards(&mut out, &missing, &recovery_shards[..missing.len()])?;
     Ok(out)
@@ -3047,6 +3219,10 @@ mod tests {
             Error::TooManyShards,
             Error::SingularElement,
             Error::RebuildTooLarge,
+            Error::RepairWorkspaceLimitExceeded {
+                limit: 1,
+                required: 2,
+            },
             Error::Io(std::io::ErrorKind::BrokenPipe),
         ] {
             assert!(!error.to_string().is_empty());
@@ -4136,6 +4312,248 @@ fn repair_marker(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod repair_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn rar5_repair_admits_discovery_reads_before_calling_range_reader() {
+        let prefix = b"data";
+        let plan = InlineRecoveryPlan {
+            data_shards: 1,
+            recovery_shards: 1,
+            group_count: 4,
+            header_size: 80,
+            shard_size: 84,
+        };
+        let chunk = build_inline_recovery_data_for_plan(prefix, plan).unwrap();
+        let control = crate::read_control::ReadControl::default();
+        let required = repair_solve_workspace_required(1, 0, 4, 0, 4).unwrap();
+        let unexpected_read = |_| -> Result<Vec<u8>> {
+            panic!("discovery must be refused before requesting range bytes")
+        };
+        assert_eq!(
+            repair_inline_recovery_prefix_shards_with_workspace_limit(
+                prefix.len(),
+                &chunk,
+                unexpected_read,
+                &control,
+                required - 1,
+            ),
+            Err(Error::RepairWorkspaceLimitExceeded {
+                limit: required - 1,
+                required,
+            })
+        );
+        assert_eq!(
+            repair_inline_recovery_prefix_shards_with_workspace_limit(
+                prefix.len(),
+                &chunk,
+                |range| Ok(prefix[range].to_vec()),
+                &control,
+                required,
+            ),
+            Ok(Vec::new())
+        );
+        // Discovery fits, but the solve and repaired output do not. It must
+        // stop after discovery rather than reread undamaged RHS shards.
+        let mut reads = 0;
+        let result = repair_inline_recovery_prefix_shards_with_workspace_limit(
+            prefix.len(),
+            &chunk,
+            |range| {
+                reads += 1;
+                Ok(b"fail"[range].to_vec())
+            },
+            &control,
+            required,
+        );
+        assert_eq!(reads, 1);
+        assert!(matches!(result,
+            Err(Error::RepairWorkspaceLimitExceeded { limit, required: solve })
+                if limit == required && solve > required
+        ));
+        let token = crate::ReadCancellation::new();
+        token.cancel();
+        assert_eq!(
+            repair_inline_recovery_prefix_shards_with_workspace_limit(
+                prefix.len(),
+                &chunk,
+                unexpected_read,
+                &crate::read_control::ReadControl::new(Some(&token)),
+                0,
+            ),
+            Err(Error::Cancelled)
+        );
+    }
+
+    #[test]
+    fn rar5_repair_workspace_admission_is_checked_and_inclusive() {
+        let limit = super::MAX_REPAIR_WORKSPACE_BYTES;
+        assert_eq!(super::admit_repair_workspace(limit), Ok(()));
+        let refusal = Error::RepairWorkspaceLimitExceeded {
+            limit,
+            required: limit + 1,
+        };
+        assert_eq!(
+            super::admit_repair_workspace(limit + 1),
+            Err(refusal.clone())
+        );
+        let typed = crate::Error::from(refusal.clone()).at_archive_offset(42);
+        assert_eq!(typed.kind(), crate::ErrorKind::ResourceLimit);
+        assert!(
+            matches!(typed.root_cause(), crate::Error::Rar5Recovery(actual) if actual == &refusal)
+        );
+        assert!(typed.to_string().contains("repair workspace limit"));
+        assert_eq!(
+            super::repair_solve_workspace_required(1, 1, 0, u64::MAX, 0),
+            Err(Error::PlanOverflow)
+        );
+        assert_eq!(
+            super::repair_workspace_product(u64::MAX, 2),
+            Err(Error::PlanOverflow)
+        );
+        // Ordinary generated geometry still fits even with all 200 shards
+        // damaged, full output buffers and read scratch.
+        let required =
+            super::repair_solve_workspace_required(200, 200, 1024, 200 * 1024, 1024).unwrap();
+        assert_eq!(super::admit_repair_workspace(required), Ok(()));
+    }
+
+    #[test]
+    fn rar5_tiny_incomplete_record_keeps_repaired_prefix_without_giant_rebuild() {
+        // One 128 KiB chunk declares 16,000 recovery rows. Only 32 KiB of
+        // parity would be rebuilt, but its full coefficient matrix is almost
+        // 0.5 GiB and repeated headers would produce a 1.9 GiB recovery record.
+        // Frame this one chunk directly, without generating the claimed rows.
+        let data_count = 16_000usize;
+        let recovery_count = 16_000usize;
+        let header_size = 0x48 + data_count * 8;
+        let shard_size = header_size + 2;
+        let mut chunk = vec![0; shard_size];
+        chunk[..4].copy_from_slice(b"{RB}");
+        chunk[0x0c..0x10].copy_from_slice(&(shard_size as u32).to_le_bytes());
+        chunk[0x10..0x14].copy_from_slice(&(header_size as u32).to_le_bytes());
+        chunk[0x14] = 1;
+        chunk[0x15] = 1;
+        chunk[0x22..0x2a].copy_from_slice(&1u64.to_le_bytes());
+        chunk[0x2a..0x32].copy_from_slice(&2u64.to_le_bytes());
+        chunk[0x32..0x3a].copy_from_slice(&(shard_size as u64).to_le_bytes());
+        chunk[0x3a..0x3c].copy_from_slice(&(data_count as u16).to_le_bytes());
+        chunk[0x3c..0x3e].copy_from_slice(&(recovery_count as u16).to_le_bytes());
+        chunk[0x40..0x48].copy_from_slice(&crc64_rar_state(b"a").to_le_bytes());
+        let gf = shared_gf16();
+        let parity = gf.mul(gf.inv(data_count as u16).unwrap(), b'a' as u16);
+        chunk[header_size..].copy_from_slice(&parity.to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[4..0x0c].copy_from_slice(&crc.to_le_bytes());
+
+        let mut archive = b"b".to_vec();
+        archive.extend_from_slice(&chunk);
+        let repaired = super::repair_inline_recovery_archive(&archive).unwrap();
+        assert_eq!(repaired.len(), archive.len());
+        assert_eq!(repaired[0], b'a');
+        assert_eq!(&repaired[1..], &archive[1..]);
+        let (reported, report) = super::repair_inline_recovery_archive_with_report(
+            &archive,
+            &super::InlineRepairOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(reported, repaired);
+        assert!(report.changed);
+        assert!(report.data_repaired);
+        assert!(!report.recovery_record_rebuilt);
+        assert!(!report.end_record_rebuilt);
+        assert_eq!(report.available_recovery_shards, Some(1));
+        assert_eq!(report.expected_recovery_shards, Some(recovery_count as u64));
+
+        let plan = InlineRecoveryPlan {
+            data_shards: data_count as u64,
+            recovery_shards: recovery_count as u64,
+            group_count: 2,
+            header_size: header_size as u64,
+            shard_size: shard_size as u64,
+        };
+        let end = 1 + plan.payload_size().unwrap() as usize;
+        assert!(matches!(
+            super::rebuild_inline_recovery_record_with_control(
+                &archive,
+                b"a",
+                1..end,
+                plan,
+                &crate::read_control::ReadControl::default(),
+            ),
+            Err(Error::RepairWorkspaceLimitExceeded { limit, required })
+                if limit == super::MAX_REPAIR_WORKSPACE_BYTES && required > limit
+        ));
+        let token = crate::ReadCancellation::new();
+        token.cancel();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        assert_eq!(
+            super::rebuild_inline_recovery_record_with_control(
+                &archive,
+                b"a",
+                1..end,
+                plan,
+                &control
+            ),
+            Err(Error::Cancelled)
+        );
+    }
+
+    #[test]
+    fn rar5_reconstruction_admits_padded_output_and_all_solve_matrices() {
+        // Less than 1 MiB of caller metadata and 8 KiB of parity used to
+        // allocate 512 MiB of zero padding before the solve was considered.
+        let empty = &[][..];
+        let mut data = vec![Some(empty); super::FIELD_SIZE - 1];
+        data[0] = None;
+        let parity = vec![0; 8192];
+        assert!(matches!(
+            reconstruct_data_shards(&data, &[(0, &parity)]),
+            Err(Error::RepairWorkspaceLimitExceeded { limit, required })
+                if limit == super::MAX_REPAIR_WORKSPACE_BYTES && required > limit
+        ));
+
+        // Tiny two-byte shards can still ask for hundreds of MiB across
+        // original equations, their working copy and the inverse together.
+        let count = 7000;
+        let data = vec![None; count];
+        let recovery = (0..count).map(|row| (row, &[0, 0][..])).collect::<Vec<_>>();
+        assert!(matches!(
+            reconstruct_data_shards(&data, &recovery),
+            Err(Error::RepairWorkspaceLimitExceeded { limit, required })
+                if limit == super::MAX_REPAIR_WORKSPACE_BYTES && required > limit
+        ));
+    }
+
+    #[test]
+    fn rar5_reconstruction_validates_before_oversized_padding() {
+        let parity = vec![0; 8192];
+        let missing = vec![None; super::FIELD_SIZE - 1];
+        assert_eq!(
+            reconstruct_data_shards(&missing, &[(0, &parity)]),
+            Err(Error::TooManyDamagedShards)
+        );
+        let mut data = vec![Some(&[][..]); super::FIELD_SIZE - 1];
+        data[0] = None;
+        assert_eq!(
+            reconstruct_data_shards(&data, &[(usize::MAX, &parity)]),
+            Err(Error::TooManyShards)
+        );
+        let long = vec![0; parity.len() + 1];
+        *data.last_mut().unwrap() = Some(&long);
+        assert_eq!(
+            reconstruct_data_shards(&data, &[(0, &parity)]),
+            Err(Error::ShardSizeMismatch)
+        );
+        assert_eq!(
+            reconstruct_data_shards(&vec![Some(&[][..]); super::FIELD_SIZE + 1], &[]),
+            Err(Error::TooManyShards)
+        );
+    }
 }
 
 #[cfg(test)]

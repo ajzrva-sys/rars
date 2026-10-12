@@ -11,6 +11,12 @@ pub enum Error {
     TooManyShards,
     SingularElement,
     RebuildTooLarge,
+    /// A repair solve, padded reconstruction or record rebuild exceeds its
+    /// fixed workspace admission ceiling. This is not a process-RAM quota.
+    RepairWorkspaceLimitExceeded {
+        limit: u64,
+        required: u64,
+    },
     Io(std::io::ErrorKind),
     /// Preserve a structured archive error from workspace admission, a reader or a sink.
     TypedIo(Box<crate::Error>),
@@ -35,6 +41,10 @@ impl std::fmt::Display for Error {
             Self::RebuildTooLarge => {
                 f.write_str("RAR 5 recovery record is too large to rebuild in memory")
             }
+            Self::RepairWorkspaceLimitExceeded { limit, required } => write!(
+                f,
+                "RAR 5 recovery repair workspace limit {limit} bytes exceeded (requires {required})"
+            ),
             Self::Io(kind) => write!(f, "RAR 5 recovery I/O failed: {kind}"),
             Self::TypedIo(error) => std::fmt::Display::fmt(error, f),
         }

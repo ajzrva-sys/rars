@@ -457,9 +457,10 @@ impl Error {
             | Self::TotalOutputLimitExceeded { .. }
             | Self::Rar50DictionaryLimitExceeded { .. }
             | Self::Rar50BufferedDecodeLimitExceeded { .. }
-            | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {
-                ErrorKind::ResourceLimit
-            }
+            | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge)
+            | Self::Rar5Recovery(crate::recovery::rar5::Error::RepairWorkspaceLimitExceeded {
+                ..
+            }) => ErrorKind::ResourceLimit,
             Self::Codec(crate::codec::Error::Io(error)) => error.kind(),
             Self::Codec(crate::codec::Error::WorkspaceLimitExceeded(_)) => ErrorKind::ResourceLimit,
             Self::Cancelled | Self::Codec(crate::codec::Error::Cancelled) => ErrorKind::Cancelled,
