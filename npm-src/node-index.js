@@ -11,8 +11,9 @@ function spawnWorker() {
     post(message) { worker.ref(); worker.postMessage(message); },
     onMessage(callback) {
       worker.on("message", (message) => {
-        callback(message);
+        // The callback can start and ref the next queued operation.
         if (!message.progress) worker.unref();
+        callback(message);
       });
     },
     onError: (callback) => worker.on("error", callback),

@@ -3,6 +3,7 @@ import "./test-wasm-bindings.cjs";
 import "./test-npm-api.mjs";
 import "./test-npm-errors.mjs";
 import "./test-npm-client.mjs";
+import "./test-npm-node.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";

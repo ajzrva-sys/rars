@@ -101,6 +101,9 @@ const parts = await writer.volumes(5 * 1024 * 1024);
 `level` runs from 0 (stored) to 5. Other options are `solid`, `password`,
 `encryptHeaders`, `comment` and `recoveryPercent`. Node additionally provides
 `addFile()`, `writeTo()` and `writeVolumesTo()`.
+For legacy formats, `writeVolumesTo()` keeps the first path and names later
+volumes `.r00` through `.r99` in the same directory. Sets exceeding 101 volumes
+or containing overlapping output paths are rejected before any file is written.
 
 Long operations accept an `AbortSignal` and progress callback:
 

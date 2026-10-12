@@ -5,14 +5,30 @@ const wasm = require("./wasm/rars_wasm.js");
 const { startWorker } = require("./worker-engine.cjs");
 
 function volumePath(firstPath, index, total, format) {
+  const parsed = path.parse(firstPath);
   if (format === "rar50" || format === "rar70") {
-    const parsed = path.parse(firstPath);
     const stem = parsed.name.replace(/\.part\d+$/i, "");
     const width = Math.max(2, String(total).length);
     return path.join(parsed.dir, `${stem}.part${String(index + 1).padStart(width, "0")}.rar`);
   }
   if (index === 0) return firstPath;
-  return firstPath.replace(/\.[^.]*$/, `.r${String(index - 1).padStart(2, "0")}`);
+  return path.join(parsed.dir, `${parsed.name}.r${String(index - 1).padStart(2, "0")}`);
+}
+
+function volumePaths(firstPath, total, format) {
+  if (!path.parse(firstPath).base) {
+    throw new TypeError("volume output needs a file name");
+  }
+  if (format !== "rar50" && format !== "rar70" && total > 101) {
+    throw new RangeError("legacy RAR volume names only support .r00 through .r99");
+  }
+  const paths = Array.from({ length: total }, (_, index) => volumePath(firstPath, index, total, format));
+  // Volume discovery is case insensitive, and these names must also remain
+  // distinct on case-insensitive filesystems (e.g. archive.R00 vs archive.r00).
+  if (new Set(paths.map((file) => path.resolve(file).toLowerCase())).size !== paths.length) {
+    throw new TypeError("volume output paths must be distinct");
+  }
+  return paths;
 }
 
 async function writeAtomic(target, bytes) {
@@ -33,7 +49,8 @@ startWorker({
   readFile: async (file) => new Uint8Array(await fs.readFile(file)),
   writeAtomic,
   async writeVolumes(firstPath, parts, format) {
-    const paths = parts.map((_, index) => volumePath(firstPath, index, parts.length, format));
+    // Validate the whole set before publishing any volume.
+    const paths = volumePaths(firstPath, parts.length, format);
     await Promise.all(parts.map((part, index) => writeAtomic(paths[index], part)));
     return paths;
   },
