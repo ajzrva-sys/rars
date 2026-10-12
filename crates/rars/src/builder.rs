@@ -2410,30 +2410,51 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let root = crate::scratch::case("builder-non-utf8-name");
-        fs::write(root.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
+        let raw_source = root.join(OsStr::from_bytes(b"bad-\xff"));
+        let native_name = match fs::write(&raw_source, b"payload") {
+            Ok(()) => b"bad-\xff".as_slice(),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    || error.raw_os_error() == Some(libc::EILSEQ) =>
+            {
+                // Some Unix filesystems reject byte names. The builder must
+                // report the missing/unrepresentable source, never queue a
+                // substituted filename or silently claim it was archived.
+                for format in ArchiveVersion::ALL {
+                    let mut builder = Builder::new(format);
+                    let error = builder.add_path(&raw_source, b"explicit").unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::Io);
+                    assert!(builder.is_empty());
+                }
+                // Continue exercising collection and explicit naming in every
+                // format with a name this filesystem can actually represent.
+                let name = "valid-日本語".as_bytes();
+                fs::write(root.join(OsStr::from_bytes(name)), b"payload").unwrap();
+                name
+            }
+            Err(error) => panic!("raw filename probe failed unexpectedly: {error}"),
+        };
+        let source = root.join(OsStr::from_bytes(native_name));
         for format in ArchiveVersion::ALL {
             let mut builder = Builder::new(format);
             for unsafe_name in [b"../bad-\xff".as_slice(), b"/bad-\xff"] {
-                assert!(builder
-                    .add_path(&root.join(OsStr::from_bytes(b"bad-\xff")), unsafe_name)
-                    .is_err());
+                assert!(builder.add_path(&source, unsafe_name).is_err());
                 assert!(builder.is_empty());
             }
             builder.add_path(&root, b"root").unwrap();
+            let native_archive_name = [b"root/".as_slice(), native_name].concat();
             let name = if format.family() == ArchiveFamily::Rar50Plus {
-                crate::filename::encode_rar50(b"root/bad-\xff").into_owned()
+                crate::filename::encode_rar50(&native_archive_name).into_owned()
             } else {
-                b"root/bad-\xff".to_vec()
+                native_archive_name
             };
             let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             assert_eq!(
                 archive.read_member(&name, None).unwrap().unwrap(),
                 b"payload"
             );
-            // A caller can still give a non-Unicode source an explicit name.
-            builder
-                .add_path(&root.join(OsStr::from_bytes(b"bad-\xff")), b"explicit")
-                .unwrap();
+            // The same native source can also have an explicit archive name.
+            builder.add_path(&source, b"explicit").unwrap();
             assert_eq!(
                 builder.names().collect::<Vec<_>>(),
                 vec![name.as_slice(), &b"explicit"[..]]

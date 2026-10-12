@@ -665,6 +665,7 @@ dependencies = [
  "criterion",
  "getrandom",
  "hmac",
+ "libc",
  "rayon",
  "sha1",
  "sha2",

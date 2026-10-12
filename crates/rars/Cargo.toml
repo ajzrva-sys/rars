@@ -47,6 +47,10 @@ rayon = { workspace = true, optional = true }
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, optional = true, features = ["wasm_js"] }
 
+# Native filename tests distinguish EILSEQ from unrelated filesystem failures.
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
