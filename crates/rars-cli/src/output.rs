@@ -772,8 +772,28 @@ mod tests {
             );
             let (mut meta, mut redirection) = redirection_fixture();
             meta.host_os = 1;
-            // A literal marker and a private-use character must survive decoding once.
-            let native = "source-\u{fffe}\u{e0ff}".as_bytes();
+            // A literal marker and a private-use character must survive decoding once,
+            // even if the test filesystem cannot create a literal U+FFFE filename.
+            let literal = "source-\u{fffe}\u{e0ff}".as_bytes();
+            meta.name = rars::filename::encode_rar50(literal).into_owned();
+            assert_eq!(
+                rar50_output_relative_path(&meta.name, meta.host_os)
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes(),
+                literal
+            );
+            let probe = dir.join(OsStr::from_bytes(literal));
+            let native = match fs::write(&probe, []) {
+                Ok(()) => {
+                    fs::remove_file(probe).unwrap();
+                    literal
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                    "source-\u{e0ff}".as_bytes()
+                }
+                Err(error) => panic!("literal filename probe failed unexpectedly: {error}"),
+            };
             meta.name = rars::filename::encode_rar50(native).into_owned();
             state
                 .open_rar50_entry(&meta)
@@ -783,10 +803,15 @@ mod tests {
             assert_eq!(state.outputs[0].name, meta.name);
             redirection.target_name = meta.name.clone();
             redirection.redirection_type = kind;
-            meta.name = rars::filename::encode_rar50(b"link-\xff").into_owned();
+            let link = if crate::scratch::supports_raw_byte_names(&dir) {
+                b"link-\xff".as_slice()
+            } else {
+                b"link-unicode".as_slice()
+            };
+            meta.name = rars::filename::encode_rar50(link).into_owned();
             state.create_rar50_redirection(&meta, &redirection).unwrap();
             assert_eq!(
-                fs::read(dir.join(OsStr::from_bytes(b"link-\xff"))).unwrap(),
+                fs::read(dir.join(OsStr::from_bytes(link))).unwrap(),
                 b"payload"
             );
             assert_eq!(
