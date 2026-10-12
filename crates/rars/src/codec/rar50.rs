@@ -1063,9 +1063,18 @@ impl<B: Budget> ReaderState<B> {
                     remaining = 0;
                 } else {
                     let start = output.len() - distance;
-                    let take = remaining.min(distance);
-                    output.extend_from_within(start..start + take)?;
-                    remaining -= take;
+                    if remaining <= distance {
+                        return output.extend_from_within(start..start + remaining);
+                    }
+                    // Newly appended bytes are initialized repetitions of
+                    // the same period. Reuse that growing run so short
+                    // overlapping matches take logarithmically many copies.
+                    while remaining > 0 {
+                        let take = remaining.min(output.len() - start);
+                        output.extend_from_within(start..start + take)?;
+                        remaining -= take;
+                    }
+                    return Ok(());
                 }
             } else {
                 let history_distance = distance - output.len();
@@ -1229,9 +1238,45 @@ impl<B: Budget> StreamingOutput<B> {
             let byte = self.byte_at_distance(1);
             return self.push_repeated(byte, length, sink);
         }
-        for _ in 0..length {
-            let byte = self.byte_at_distance(distance);
-            self.push(byte, sink)?;
+        let mut remaining = length;
+        while remaining != 0 {
+            let available = STREAM_FLUSH_THRESHOLD - self.pending.len();
+            if distance <= self.pending.len() {
+                // Seed the repeated run from the preceding distance bytes.
+                // Each append makes a larger initialized run available, so
+                // overlapping short-distance matches double instead of
+                // copying one period (or one byte) at a time.
+                let start = self.pending.len() - distance;
+                let mut run = remaining.min(available);
+                while run != 0 {
+                    let take = run.min(self.pending.len() - start);
+                    self.pending.extend_from_within(start..start + take)?;
+                    self.written += take;
+                    remaining -= take;
+                    run -= take;
+                }
+            } else {
+                // VecDeque history can wrap into two slices. Copy only the
+                // current contiguous part; once the source reaches pending,
+                // the initialized-run path above handles the overlap.
+                let history_distance = distance - self.pending.len();
+                let start = self.history.len() - history_distance;
+                let (first, second) = self.history.as_slices();
+                let source = if start < first.len() {
+                    &first[start..]
+                } else {
+                    &second[start - first.len()..]
+                };
+                let take = remaining.min(available).min(source.len());
+                self.pending
+                    .extend_from_slice(&source[..take])
+                    .map_err(|error| StreamDecodeError::Decode(error.into()))?;
+                self.written += take;
+                remaining -= take;
+            }
+            if self.pending.len() == STREAM_FLUSH_THRESHOLD {
+                self.flush(sink)?;
+            }
         }
         Ok(())
     }
@@ -1756,3 +1801,7 @@ impl<'a> BitReader<'a> {
 fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
     super::canonical::validate_counts(count, "RAR 5 oversubscribed Huffman table")
 }
+
+#[cfg(test)]
+#[path = "rar50/streaming_copy_tests.rs"]
+mod streaming_copy_tests;

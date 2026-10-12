@@ -72,3 +72,8 @@ required-features = ["write"]
 [[bench]]
 name = "huffman_tables"
 harness = false
+
+[[bench]]
+name = "streaming_decode"
+harness = false
+required-features = ["write"]
