@@ -2179,6 +2179,104 @@ impl TokenPrices<'_> {
     }
 }
 
+/// Length-slot prices are invariant throughout one pass. A run also keeps the
+/// same distance and arriving state while it prices every possible endpoint.
+struct OptimalMatchPrices {
+    new_lengths: [u32; LENGTH_TABLE_SIZE],
+    repeat_lengths: [u32; LENGTH_TABLE_SIZE],
+    repeats: [u32; 4],
+    last_repeat: u32,
+}
+
+struct MatchRunPrice<'a> {
+    lengths: &'a [u32; LENGTH_TABLE_SIZE],
+    distance: u32,
+    bonus: usize,
+    last_length: Option<usize>,
+    last_repeat: u32,
+}
+
+impl OptimalMatchPrices {
+    fn new(prices: Option<&TokenPrices<'_>>) -> Self {
+        Self {
+            new_lengths: std::array::from_fn(|slot| {
+                let code = prices.map_or(0, |prices| {
+                    TokenPrices::code(prices.lengths.main[262 + slot])
+                });
+                (code + usize::from(length_slot_extra_bits(slot))) as u32
+            }),
+            repeat_lengths: std::array::from_fn(|slot| {
+                let code =
+                    prices.map_or(0, |prices| TokenPrices::code(prices.lengths.length[slot]));
+                (code + usize::from(length_slot_extra_bits(slot))) as u32
+            }),
+            repeats: std::array::from_fn(|index| {
+                prices.map_or(5, |prices| {
+                    TokenPrices::code(prices.lengths.main[258 + index]) as u32
+                })
+            }),
+            last_repeat: prices.map_or(2, |prices| {
+                TokenPrices::code(prices.lengths.main[257]) as u32
+            }),
+        }
+    }
+
+    fn run(
+        &self,
+        state: &EncoderMatchState,
+        distance: usize,
+        distance_size: usize,
+        prices: Option<&TokenPrices<'_>>,
+    ) -> Result<MatchRunPrice<'_>> {
+        if let Some(index) = state
+            .reps
+            .iter()
+            .position(|&repeat| repeat == distance && repeat != 0)
+        {
+            return Ok(MatchRunPrice {
+                lengths: &self.repeat_lengths,
+                distance: self.repeats[index],
+                bonus: 0,
+                last_length: (index == 0).then_some(state.last_length),
+                last_repeat: self.last_repeat,
+            });
+        }
+        let (slot, extra) = distance_slot_for_match(distance, distance_size)?;
+        let bits = distance_slot_bit_count(slot)?;
+        let cost = prices.map_or(10 + bits, |prices| {
+            TokenPrices::code(prices.lengths.distance[slot])
+                + if bits >= 4 {
+                    bits - 4 + TokenPrices::code(prices.lengths.align[extra & 0x0f])
+                } else {
+                    bits
+                }
+        });
+        Ok(MatchRunPrice {
+            lengths: &self.new_lengths,
+            distance: cost as u32,
+            bonus: length_bonus(distance),
+            last_length: None,
+            last_repeat: self.last_repeat,
+        })
+    }
+}
+
+impl MatchRunPrice<'_> {
+    #[inline]
+    fn cost(&self, length: usize) -> Option<u32> {
+        if self.last_length == Some(length) {
+            return Some(self.last_repeat);
+        }
+        let encoded = length.checked_sub(self.bonus)?;
+        if encoded < 2 {
+            return None;
+        }
+        debug_assert!(length <= MAX_ENCODER_MATCH_LENGTH);
+        let (slot, _) = length_slot_for_valid_match(encoded);
+        Some(self.distance + self.lengths[slot])
+    }
+}
+
 struct OptimalSlices<'a> {
     price: &'a mut [u32],
     arrive_length: &'a mut [u32],
@@ -2215,6 +2313,7 @@ fn price_optimal_paths(
     // The first position past a match the parse committed to. Nothing is
     // priced from the positions before it. See [`NICE_MATCH_LENGTH`].
     let mut committed_through = 0usize;
+    let match_prices = OptimalMatchPrices::new(prices);
 
     for index in 0..span {
         let pos = start + index;
@@ -2301,14 +2400,13 @@ fn price_optimal_paths(
                 }
                 length = committed;
             }
+            let Ok(run_price) = match_prices.run(&state, distance, distance_size, prices) else {
+                continue;
+            };
             while length <= run_end {
                 let reach = length;
-                let cost = match prices {
-                    Some(prices) => prices.match_cost(&state, reach, distance, distance_size),
-                    None => estimated_match_cost(&state, reach, distance, distance_size),
-                };
-                if let Ok(cost) = cost {
-                    let reached = here.saturating_add(cost as u32);
+                if let Some(cost) = run_price.cost(reach) {
+                    let reached = here.saturating_add(cost);
                     let target = index + reach;
                     if reached < price[target] {
                         price[target] = reached;
@@ -3323,3 +3421,7 @@ fn try_write_level_lengths<B: Budget>(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pricing_tests.rs"]
+mod pricing_tests;
