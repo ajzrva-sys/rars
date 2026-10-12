@@ -82,3 +82,8 @@ required-features = ["write"]
 name = "rar50_hash"
 harness = false
 required-features = ["write"]
+
+[[bench]]
+name = "huffman_decode"
+harness = false
+required-features = ["write"]

@@ -1769,18 +1769,41 @@ impl<'a> BitReader<'a> {
         Self { input, bit_pos: 0 }
     }
 
+    #[inline]
     fn read_bits(&mut self, count: u8) -> Result<u32> {
         let count = usize::from(count);
         let byte_pos = self.bit_pos / 8;
         let bit_offset = self.bit_pos % 8;
-        // A read spans at most 33 bits after accounting for its starting
-        // offset. Compare that local byte span rather than multiplying the
-        // entire input length by eight, which can overflow for a huge slice.
+        // Compare the local byte span instead of multiplying the entire input
+        // length by eight, which can overflow for a huge slice.
         let bytes_needed = (bit_offset + count).div_ceil(8);
         if bytes_needed > self.input.len().saturating_sub(byte_pos) {
             return Err(Error::NeedMoreInput);
         }
 
+        if count == 0 {
+            return Ok(0);
+        }
+        if count <= 32 {
+            // Read the at-most-five physical bytes once, then discard the
+            // leading and trailing bits. No speculative padding is read, and
+            // input refusal leaves the cursor at its original position.
+            let bytes = &self.input[byte_pos..byte_pos + bytes_needed];
+            let word = match bytes {
+                [a] => u64::from(*a),
+                [a, b] => u64::from(u16::from_be_bytes([*a, *b])),
+                [a, b, c] => u64::from(u32::from_be_bytes([0, *a, *b, *c])),
+                [a, b, c, d] => u64::from(u32::from_be_bytes([*a, *b, *c, *d])),
+                [a, b, c, d, e] => u64::from_be_bytes([0, 0, 0, *a, *b, *c, *d, *e]),
+                _ => unreachable!("a nonempty 32-bit read spans at most five bytes"),
+            };
+            let shift = bytes_needed * 8 - bit_offset - count;
+            let value = ((word >> shift) & ((1u64 << count) - 1)) as u32;
+            self.bit_pos += count;
+            return Ok(value);
+        }
+
+        // Preserve the existing low-32-bit result for larger internal reads.
         let mut value = 0u32;
         let mut remaining = count;
         while remaining != 0 {
@@ -1811,3 +1834,7 @@ mod streaming_copy_tests;
 #[cfg(test)]
 #[path = "rar50/huffman_tests.rs"]
 mod huffman_tests;
+
+#[cfg(test)]
+#[path = "rar50/bit_reader_tests.rs"]
+mod bit_reader_tests;
