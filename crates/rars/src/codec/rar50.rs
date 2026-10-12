@@ -576,6 +576,14 @@ impl<B: Budget> ReaderState<B> {
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
+        self.try_clone_with_spare_capacity(false)
+    }
+
+    pub(crate) fn try_clone_for_stream(&self) -> Result<Self> {
+        self.try_clone_with_spare_capacity(!B::LIMITED)
+    }
+
+    fn try_clone_with_spare_capacity(&self, preserve_capacity: bool) -> Result<Self> {
         Ok(Self {
             read_control: self.read_control.clone(),
             tables: self
@@ -585,7 +593,21 @@ impl<B: Budget> ReaderState<B> {
                 .transpose()?,
             reps: self.reps,
             last_length: self.last_length,
-            history: Buffer::copied(&self.history, &self.history.allowance())?,
+            history: if preserve_capacity {
+                // Solid streaming checkpoints otherwise discard geometric spare
+                // capacity and grow again after each member. Keep the capacity
+                // so a run of small members reuses a few allocation sizes.
+                let mut history =
+                    Buffer::with_capacity(self.history.capacity(), &self.history.allowance())?;
+                history
+                    .extend_from_slice(&self.history)
+                    .map_err(Into::into)?;
+                history
+            } else {
+                // Public clones and bounded streaming checkpoints retain their
+                // existing allocation charge and refusal boundary.
+                Buffer::copied(&self.history, &self.history.allowance())?
+            },
         })
     }
     pub fn decode_member(
@@ -1838,3 +1860,7 @@ mod huffman_tests;
 #[cfg(test)]
 #[path = "rar50/bit_reader_tests.rs"]
 mod bit_reader_tests;
+
+#[cfg(test)]
+#[path = "rar50/checkpoint_tests.rs"]
+mod checkpoint_tests;

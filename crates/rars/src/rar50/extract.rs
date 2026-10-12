@@ -1111,7 +1111,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        let mut streaming_decoder = self.decoder.try_clone()?;
+        let mut streaming_decoder = self.decoder.try_clone_for_stream()?;
         let (mut packed, keys) = file
             .packed_reader_with_allowance(archive, self.password, &self.allowance)
             .map_err(|error| file.entry_error("reading", error))?;
@@ -1165,7 +1165,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         // Keep solid state only after successful emission and integrity checks,
         // just as for a non-split streaming member.
         self.decoder.read_control.check()?;
-        let mut decoder = self.decoder.try_clone()?;
+        let mut decoder = self.decoder.try_clone_for_stream()?;
         let control = decoder.read_control.clone();
         let mut packed =
             split.fragment_reader_with_allowance(volumes, decryptor, &self.allowance)?;
@@ -2094,6 +2094,163 @@ mod tests {
             name.to_vec(),
             crate::EntrySource::from_bytes(Arc::<[u8]>::from(data.to_vec())),
         )
+    }
+
+    #[test]
+    fn streaming_checkpoint_rolls_back_filter_sink_cancellation_and_integrity_failures() {
+        let mut word = 0x1234_5678u32;
+        // Avoid a period aligned with the 64 KiB flush: appending or resetting
+        // to the first failed flush must change the successor's match bytes.
+        let seed: Vec<_> = (0..32749)
+            .map(|_| {
+                word ^= word << 13;
+                word ^= word >> 17;
+                word ^= word << 5;
+                word as u8
+            })
+            .collect();
+        let first_data = seed.repeat(4);
+        let next_data = first_data[127..4224].to_vec();
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar50)
+            .store(false)
+            .solid(true)
+            .compression_level(Some(1));
+        builder
+            .add_bytes(b"first".to_vec(), first_data.clone(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"next".to_vec(), next_data.clone(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        let files: Vec<_> = archive.files().collect();
+        assert!(files.iter().all(|file| !file.is_stored()));
+        assert!(files[1].decoded_compression_info().unwrap().solid);
+        assert!(
+            files[1].packed_size() < 128,
+            "next member must use old history"
+        );
+
+        let filtered_data = b"late filter checkpoint bytes\n".repeat(8192);
+        let filtered_bytes = Rar50Writer::new(
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(1),
+        )
+        .entry(entry(b"filtered", &filtered_data))
+        .filter_policy(FilterPolicy::Explicit(crate::FilterSpec::range(
+            FilterKind::E8,
+            128 * 1024..filtered_data.len(),
+        )))
+        .finish()
+        .unwrap();
+        let filtered_archive = Archive::parse_owned(filtered_bytes).unwrap();
+        let mut filtered = filtered_archive.files().next().unwrap().clone();
+        filtered.compression_info |= 0x40;
+
+        struct CancelOnWrite<'a> {
+            token: &'a crate::ReadCancellation,
+            written: usize,
+        }
+        impl Write for CancelOnWrite<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.written += bytes.len();
+                self.token.cancel();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct RejectWrite;
+        impl Write for RejectWrite {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("checkpoint sink failed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for failure in ["filter", "sink", "cancellation", "integrity"] {
+            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+            session
+                .write_file_to(&archive, files[0], &mut std::io::sink())
+                .unwrap();
+            match failure {
+                "filter" => {
+                    let mut partial = Vec::new();
+                    let error = session
+                        .write_file_to(&filtered_archive, &filtered, &mut partial)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+                    assert!(partial.len() >= 64 * 1024, "filter follows a flush");
+                }
+                "sink" => {
+                    let error = session
+                        .write_file_to(&archive, files[0], &mut RejectWrite)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::Io);
+                }
+                "cancellation" => {
+                    let token = crate::ReadCancellation::new();
+                    session.decoder.read_control =
+                        crate::read_control::ReadControl::new(Some(&token));
+                    let mut writer = CancelOnWrite {
+                        token: &token,
+                        written: 0,
+                    };
+                    let error = session
+                        .write_file_to(&archive, files[0], &mut writer)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
+                    assert!(writer.written >= 64 * 1024);
+                    session.decoder.read_control = Default::default();
+                }
+                "integrity" => {
+                    let mut corrupt = files[1].clone();
+                    corrupt.hash = None;
+                    corrupt.data_crc32 = Some(crc32(&next_data) ^ 1);
+                    let error = session
+                        .write_file_to(&archive, &corrupt, &mut std::io::sink())
+                        .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+                }
+                _ => unreachable!(),
+            }
+            // The successor references the old, nonperiodic raw dictionary.
+            // A failed checkpoint must not have reset or appended to it.
+            let mut decoded = Vec::new();
+            session
+                .write_file_to(&archive, files[1], &mut decoded)
+                .unwrap();
+            assert_eq!(decoded, next_data, "after {failure}");
+        }
+
+        // Prove the successor detects the two erroneous history states that
+        // the failed first flush could publish, rather than accepting a fixture
+        // whose repeating phase accidentally masks a broken checkpoint.
+        let prefix = &first_data[..64 * 1024];
+        let packed_prefix = crate::codec::rar50::encode_literal_only(prefix, 0).unwrap();
+        for appended in [false, true] {
+            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+            session
+                .write_file_to(&archive, files[0], &mut std::io::sink())
+                .unwrap();
+            session
+                .decoder
+                .decode_member_from_reader_with_dictionary_to_sink(
+                    &mut packed_prefix.as_slice(),
+                    0,
+                    prefix.len(),
+                    4 * 1024 * 1024,
+                    appended,
+                    |_| Ok::<(), std::convert::Infallible>(()),
+                )
+                .unwrap();
+            let error = session
+                .write_file_to(&archive, files[1], &mut std::io::sink())
+                .unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+        }
     }
 
     #[test]
