@@ -1734,7 +1734,9 @@ impl<B: Budget> HuffmanState<B> {
                 return Err(Error::InvalidData("RAR 5 Huffman length is too large"));
             }
             if length != 0 {
-                count[length as usize] += 1;
+                count[length as usize] = count[length as usize]
+                    .checked_add(1)
+                    .ok_or(Error::InvalidData("RAR 5 oversubscribed Huffman table"))?;
             }
         }
         validate_huffman_counts(&count)?;
@@ -1805,3 +1807,7 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
 #[cfg(test)]
 #[path = "rar50/streaming_copy_tests.rs"]
 mod streaming_copy_tests;
+
+#[cfg(test)]
+#[path = "rar50/huffman_tests.rs"]
+mod huffman_tests;
