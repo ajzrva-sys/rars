@@ -40,8 +40,9 @@ use rars::rar15_40::{
     WriterOptions as Rar15WriterOptions,
 };
 use rars::{
-    extract_volumes_to_with_options, Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader,
-    ArchiveVersion, FeatureSet, MemberCoding,
+    extract_volumes_to_with_options, test_volumes_with_options_and_callback,
+    Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet,
+    MemberCoding,
 };
 use repair::cmd_repair;
 use std::cell::RefCell;
@@ -619,19 +620,20 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         let options = args
             .read_options
             .options(password_bytes(&password), scratch.as_ref());
-        extract_archive_to_with_options(&archive, options, |meta| {
-            entries.push(meta.clone());
-            Ok(Box::new(std::io::sink()))
-        })
-        .map_err(|err| {
-            classify_rars_error(err, |err| {
-                format!(
-                    "failed to test archive '{}': {err}{}",
-                    paths[0].display(),
-                    rar50_buffered_decode_limit_hint(err)
-                )
+        archive
+            .test_with_options_and_callback(options, |meta| {
+                entries.push(meta.clone());
+                Ok(())
             })
-        })?;
+            .map_err(|err| {
+                classify_rars_error(err, |err| {
+                    format!(
+                        "failed to test archive '{}': {err}{}",
+                        paths[0].display(),
+                        rar50_buffered_decode_limit_hint(err)
+                    )
+                })
+            })?;
         for entry in &entries {
             print_ok_entry(entry);
         }
@@ -645,9 +647,9 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         let options = args
             .read_options
             .options(password_bytes(&password), scratch.as_ref());
-        extract_volumes_to_with_options(&archives, options, |meta| {
+        test_volumes_with_options_and_callback(&archives, options, |meta| {
             entries.push(meta.clone());
-            Ok(Box::new(std::io::sink()))
+            Ok(())
         })
         .map_err(|err| {
             classify_rars_error(err, |err| {

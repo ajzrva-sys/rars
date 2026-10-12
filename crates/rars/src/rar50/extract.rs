@@ -829,6 +829,36 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.parallel_to_impl(options, &mut open, false)
+    }
+
+    pub(crate) fn test_to<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut tested: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+    {
+        self.parallel_to_impl(
+            options,
+            &mut |meta| {
+                tested(meta)?;
+                Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+            },
+            true,
+        )
+    }
+
+    fn parallel_to_impl<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        verification: bool,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
         options.check_cancelled()?;
         // Admit and charge total-limited work in archive order before dispatch.
         if options.rar50_scratch.is_some()
@@ -854,7 +884,11 @@ impl Archive {
                     if file.is_directory() || file.redirection.is_some() {
                         0
                     } else if file.is_stored() {
-                        file.unpacked_size
+                        if verification {
+                            0
+                        } else {
+                            file.unpacked_size
+                        }
                     } else {
                         file.unpacked_size
                             .saturating_add(file.packed_size())
@@ -869,10 +903,11 @@ impl Archive {
                         options.password,
                         rar50_buffered_decode_limit(options),
                         options,
+                        verification,
                         local,
                     )
                 },
-                |entry| write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()), &publication),
+                |entry| write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication),
             );
         }
 
@@ -894,10 +929,17 @@ impl Archive {
                 batch.push(files.next().expect("peeked file"));
             }
             let entries = crate::parallel::map_collect(batch, |file| {
-                decode_parallel_entry(self, file, password, buffered_decode_limit, options)
+                decode_parallel_entry(
+                    self,
+                    file,
+                    password,
+                    buffered_decode_limit,
+                    options,
+                    verification,
+                )
             })?;
             for entry in entries {
-                write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()), &publication)?;
+                write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication)?;
             }
         }
         options.check_cancelled()?;
@@ -911,6 +953,7 @@ fn decode_parallel_entry(
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
+    verification: bool,
 ) -> Result<ParallelExtractedEntry> {
     decode_parallel_entry_with_allowance(
         archive,
@@ -918,12 +961,14 @@ fn decode_parallel_entry(
         password,
         buffered_decode_limit,
         options,
+        verification,
         &Allowance::default(),
     )
 }
 
 enum ParallelExtractedEntry<B: Budget = Allowance> {
     Directory(ExtractedEntryMeta),
+    Verified(ExtractedEntryMeta),
     File {
         meta: ExtractedEntryMeta,
         data: Buffer<u8, B>,
@@ -940,6 +985,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
+    verification: bool,
     allowance: &B,
 ) -> Result<ParallelExtractedEntry<B>> {
     options.check_cancelled()?;
@@ -957,10 +1003,16 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
-    let mut data = Buffer::new(allowance);
     let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
+    if verification {
+        budget.run(&file.name, std::io::sink(), |writer| {
+            session.write_file_to(archive, file, writer)
+        })?;
+        return Ok(ParallelExtractedEntry::Verified(meta));
+    }
+    let mut data = Buffer::new(allowance);
     budget.run(&file.name, &mut data, |writer| {
         session.write_file_to(archive, file, writer)
     })?;
@@ -979,7 +1031,7 @@ where
 {
     control.check()?;
     match entry {
-        ParallelExtractedEntry::Directory(meta) => {
+        ParallelExtractedEntry::Directory(meta) | ParallelExtractedEntry::Verified(meta) => {
             let _ = open(&meta)?;
         }
         ParallelExtractedEntry::File { meta, data } => {
@@ -1180,6 +1232,20 @@ where
 {
     options.check_cancelled()?;
     extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false)
+}
+
+pub(crate) fn test_volumes_to<F>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    mut tested: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+{
+    extract_volumes_to(volumes, options, |meta| {
+        tested(meta)?;
+        Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+    })
 }
 
 pub fn extract_volumes_to_with_redirections<F, R>(

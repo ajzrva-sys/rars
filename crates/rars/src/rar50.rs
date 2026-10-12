@@ -24,6 +24,7 @@ mod framing;
 #[cfg(feature = "write")]
 pub(crate) mod write;
 
+pub(crate) use extract::test_volumes_to;
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 #[cfg(feature = "write")]
 pub use write::{

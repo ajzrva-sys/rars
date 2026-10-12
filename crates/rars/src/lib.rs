@@ -319,7 +319,7 @@ pub enum Archive {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-/// Metadata supplied to streaming extraction callbacks.
+/// Metadata supplied to extraction and verification callbacks.
 pub struct ExtractedEntryMeta {
     /// The format supplied Unicode; legacy encoding overrides must not apply.
     pub name_is_unicode: bool,
@@ -941,8 +941,35 @@ impl Archive {
     /// Parsing-only limits are not reapplied; comments and recovery are outside
     /// this payload test. Each call starts fresh output budgets.
     pub fn test_with_options(&self, options: ArchiveReadOptions<'_>) -> Result<()> {
+        self.test_with_options_and_callback(options, |_| Ok(()))
+    }
+
+    /// Verifies payloads and reports regular entries and directories once, in
+    /// archive order. Redirections are skipped, as in ordinary extraction.
+    ///
+    /// Callbacks do not receive payload bytes. A callback can precede that
+    /// member's verification; earlier callbacks can have run when the call fails.
+    /// Only successful completion verifies every payload. Cancellation is checked
+    /// around callbacks, and a callback error aborts the operation.
+    ///
+    /// RAR5 verification discards each worker's decoded output rather than
+    /// retaining another buffer for publication. Buffered, streaming and scratch
+    /// decoding retain their extraction routing. All output, dictionary and
+    /// workspace limits also apply to discarded output.
+    pub fn test_with_options_and_callback<F>(
+        &self,
+        options: ArchiveReadOptions<'_>,
+        mut tested: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+    {
         options.check_cancelled()?;
-        self.extract_to_parallel_buffered_with_options(options, |_| {
+        if let Self::Rar50Plus(archive) = self {
+            return archive.test_to(options, |meta| tested(&rar50_meta(meta)));
+        }
+        self.extract_to_parallel_buffered_with_options(options, |meta| {
+            tested(meta)?;
             Ok(Box::new(std::io::sink()) as Box<dyn Write>)
         })
     }
@@ -1442,6 +1469,40 @@ where
             rar50::extract_volumes_to(&typed, options, |meta| open(&rar50_meta(meta)))
         }
     }
+}
+
+/// Verifies every logical payload in a volume set and discards decoded output.
+/// Has the resource and cancellation policies of [`Archive::test_with_options`].
+pub fn test_volumes_with_options(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
+) -> Result<()> {
+    test_volumes_with_options_and_callback(archives, options, |_| Ok(()))
+}
+
+/// Verifies a volume set with metadata callbacks. Split members produce one
+/// callback at their final fragment, in logical archive order. Has the callback
+/// and failure semantics of [`Archive::test_with_options_and_callback`].
+pub fn test_volumes_with_options_and_callback<F>(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
+    mut tested: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+{
+    options.check_cancelled()?;
+    let Some(first) = archives.first() else {
+        return Err(Error::InvalidHeader("volume set is empty"));
+    };
+    if first.family() == ArchiveFamily::Rar50Plus {
+        let typed = rar50_volumes(archives)?;
+        return rar50::test_volumes_to(&typed, options, |meta| tested(&rar50_meta(meta)));
+    }
+    extract_volumes_to_with_options(archives, options, |meta| {
+        tested(meta)?;
+        Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+    })
 }
 
 /// Returns the logical members in a volume set in archive order.
