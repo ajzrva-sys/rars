@@ -964,6 +964,7 @@ impl Entry {
                 Rar13Cipher::for_password(password)?,
                 &mut checksum_writer,
             )?;
+            checksum.verify_stored_length(self.header.unp_size)?;
             let actual = checksum.finish();
             return if actual == self.header.file_crc {
                 Ok(())
@@ -980,6 +981,7 @@ impl Entry {
             checksum: &mut checksum,
         };
         self.write_packed_data(archive, &mut checksum_writer)?;
+        checksum.verify_stored_length(self.header.unp_size)?;
         let actual = checksum.finish();
         if actual == self.header.file_crc {
             Ok(())
@@ -1227,17 +1229,31 @@ impl<W: Write + ?Sized> Write for Rar13ChecksumWriter<'_, W> {
 
 struct Rar13Checksum {
     value: u16,
+    written: u64,
 }
 
 impl Rar13Checksum {
     fn new() -> Self {
-        Self { value: 0 }
+        Self {
+            value: 0,
+            written: 0,
+        }
     }
 
     fn update(&mut self, input: &[u8]) {
+        self.written = self.written.saturating_add(input.len() as u64);
         for &byte in input {
             self.value = self.value.wrapping_add(byte as u16).rotate_left(1);
         }
+    }
+
+    fn verify_stored_length(&self, expected: u32) -> Result<()> {
+        if self.written != u64::from(expected) {
+            return Err(Error::InvalidHeader(
+                "RAR 1.3 stored file has mismatched packed and unpacked sizes",
+            ));
+        }
+        Ok(())
     }
 
     fn finish(self) -> u16 {
@@ -1333,6 +1349,7 @@ impl<B: Budget> PendingSplitRefs<B> {
             };
             if self.method == METHOD_STORE {
                 std::io::copy(&mut reader, &mut checksum_writer)?;
+                checksum.verify_stored_length(final_entry.header.unp_size)?;
             } else {
                 unpack15.decode_member_from_reader(
                     &mut reader,
