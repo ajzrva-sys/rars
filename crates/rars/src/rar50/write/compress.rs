@@ -1028,14 +1028,13 @@ fn read_block<B: Budget>(
     splitter.accept(&data);
     while stream.has_more() {
         let next = read_chunk(stream, block_size, progress)?;
-        if !splitter.extends(&next) {
+        if !splitter.try_extend(&next) {
             // Deciding needs the chunk in hand, so this reads one further than
             // it keeps. Hand it back for the next block rather than seeking
             // backwards, which an `EntryReader` cannot always do.
             stream.pushback = next;
             break;
         }
-        splitter.accept(&next);
         data.extend_from_slice(&next)
             .map_err(Into::<crate::codec::Error>::into)?;
     }

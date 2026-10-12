@@ -117,13 +117,32 @@ impl BlockSplitter {
     /// Integer arithmetic throughout, because a block boundary decided by
     /// floating point would let the same input pack to different archives on
     /// two platforms whose `log2` disagree in the last bit.
+    /// An accepted chunk is folded into the block; refusal leaves it unchanged.
+    pub(crate) fn try_extend(&mut self, chunk: &[u8]) -> bool {
+        let Some(counts) = self.extension_counts(chunk) else {
+            return false;
+        };
+        // The decision already counted every byte. Fold those counts instead
+        // of scanning an accepted chunk a second time through accept().
+        for (ours, theirs) in self.counts.iter_mut().zip(counts) {
+            *ours += theirs;
+        }
+        self.total += chunk.len() as u64;
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn extends(&self, chunk: &[u8]) -> bool {
+        self.extension_counts(chunk).is_some()
+    }
+
+    fn extension_counts(&self, chunk: &[u8]) -> Option<[u32; 256]> {
         let open = self.total;
         if open == 0 || chunk.is_empty() {
-            return false;
+            return None;
         }
         if open + chunk.len() as u64 > MAX_LZ_BLOCK_SIZE as u64 {
-            return false;
+            return None;
         }
         let mut counts = [0u32; 256];
         for &byte in chunk {
@@ -136,7 +155,73 @@ impl BlockSplitter {
         for (theirs, ours) in counts.iter().zip(&self.counts) {
             misplaced += (u64::from(*theirs) * open).abs_diff(u64::from(*ours) * chunk_len);
         }
-        misplaced / open <= chunk_len / BLOCK_DRIFT_DIVISOR
+        (misplaced / open <= chunk_len / BLOCK_DRIFT_DIVISOR).then_some(counts)
+    }
+}
+
+#[cfg(test)]
+mod splitter_tests {
+    use super::{BlockSplitter, LZ_BLOCK_SIZE, MAX_LZ_BLOCK_SIZE};
+
+    #[test]
+    fn drift_threshold_accepts_256_changed_bytes_and_refuses_257() {
+        let initial = vec![0; LZ_BLOCK_SIZE];
+        for (changed, accepted) in [(256, true), (257, false)] {
+            let mut splitter = BlockSplitter::new();
+            splitter.accept(&initial);
+            let mut next = initial.clone();
+            next[..changed].fill(1);
+            assert_eq!(splitter.try_extend(&next), accepted);
+            if accepted {
+                assert_eq!(splitter.total, (2 * LZ_BLOCK_SIZE) as u64);
+                assert_eq!(splitter.counts[0], (2 * LZ_BLOCK_SIZE - changed) as u32);
+                assert_eq!(splitter.counts[1], changed as u32);
+            } else {
+                assert_eq!(splitter.total, LZ_BLOCK_SIZE as u64);
+                assert_eq!(splitter.counts[0], LZ_BLOCK_SIZE as u32);
+                assert_eq!(splitter.counts[1], 0);
+            }
+            assert!(splitter.counts[2..].iter().all(|&count| count == 0));
+        }
+    }
+
+    #[test]
+    fn one_pass_extension_preserves_decisions_counts_and_refused_state() {
+        let initial = vec![0; LZ_BLOCK_SIZE];
+        for changed in [0, 1, 128, 255, 256, 257, 512, 1024] {
+            let mut next = initial.clone();
+            next[..changed].fill(1);
+            let mut reference = BlockSplitter::new();
+            let mut actual = BlockSplitter::new();
+            assert!(!actual.try_extend(&next));
+            assert_eq!(actual.counts, reference.counts);
+            assert_eq!(actual.total, reference.total);
+            reference.accept(&initial);
+            actual.accept(&initial);
+            for chunk in [&next[..], &initial[..], &[][..], &next[..], &initial[..31]] {
+                let expected = reference.extends(chunk);
+                assert_eq!(actual.try_extend(chunk), expected, "changed={changed}");
+                if expected {
+                    reference.accept(chunk);
+                }
+                assert_eq!(actual.counts, reference.counts);
+                assert_eq!(actual.total, reference.total);
+            }
+        }
+        let mut reference = BlockSplitter::new();
+        let mut actual = BlockSplitter::new();
+        reference.accept(&vec![7; MAX_LZ_BLOCK_SIZE - LZ_BLOCK_SIZE]);
+        actual.accept(&vec![7; MAX_LZ_BLOCK_SIZE - LZ_BLOCK_SIZE]);
+        for length in [LZ_BLOCK_SIZE, 1, 0] {
+            let chunk = vec![7; length];
+            let expected = reference.extends(&chunk);
+            assert_eq!(actual.try_extend(&chunk), expected);
+            if expected {
+                reference.accept(&chunk);
+            }
+            assert_eq!(actual.counts, reference.counts);
+            assert_eq!(actual.total, reference.total);
+        }
     }
 }
 
@@ -558,11 +643,10 @@ fn reader_to_with_allowance<B: Budget>(
                 .map_err(|_| crate::Error::InvalidHeader("RAR 5 block size overflows usize"))?;
             reader.read_exact(&mut chunk[..wanted])?;
             remaining -= wanted as u64;
-            if !splitter.extends(&chunk[..wanted]) {
+            if !splitter.try_extend(&chunk[..wanted]) {
                 held = Some(Buffer::copied(&chunk[..wanted], allowance)?);
                 break;
             }
-            splitter.accept(&chunk[..wanted]);
             block
                 .extend_from_slice(&chunk[..wanted])
                 .map_err(Into::<Error>::into)?;
@@ -1025,10 +1109,9 @@ fn encode_member_with_allowance<B: Budget>(
             while block_end < combined.len() {
                 let next_end = (block_end + LZ_BLOCK_SIZE).min(combined.len());
                 let next = &combined[block_end..next_end];
-                if !splitter.extends(next) {
+                if !splitter.try_extend(next) {
                     break;
                 }
-                splitter.accept(next);
                 block_end = next_end;
             }
             let is_last = block_end == combined.len();
