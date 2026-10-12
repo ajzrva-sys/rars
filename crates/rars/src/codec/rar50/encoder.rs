@@ -266,7 +266,7 @@ const NICE_MATCH_LENGTH: usize = 512;
 
 const MAX_MATCH_CANDIDATES: usize = 256;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct LengthSlices<'a> {
     main: &'a [u8],
     distance: &'a [u8],
@@ -2462,6 +2462,8 @@ fn optimal_tokens_in_workspace<B: Budget>(
     matches: &BlockMatches<B>,
     workspace: &mut OptimalWorkspace<B>,
 ) -> Result<Buffer<EncodeToken, B>> {
+    #[cfg(test)]
+    convergence_tests::record_pricing_pass();
     let start = block.start;
     let end = block.end;
     let span = end - start;
@@ -2628,8 +2630,10 @@ fn encode_tokens_with_allowance<B: Budget>(
             if next == tokens {
                 break;
             }
-            lengths =
+            let next_lengths =
                 table_lengths_with_allowance(&next, initial_filters, distance_size, allowance)?;
+            let tables_converged = lengths.slices() == next_lengths.slices();
+            lengths = next_lengths;
             let bits = token_stream_bits(&next, initial_filters, &lengths, distance_size)?;
             if bits < best_bits {
                 best_bits = bits;
@@ -2639,6 +2643,12 @@ fn encode_tokens_with_allowance<B: Budget>(
                 best = Some(std::mem::replace(&mut tokens, Buffer::new(allowance)));
             }
             tokens = next;
+            if tables_converged {
+                // With the same matches, initial state and table prices, the
+                // next pass would reproduce these tokens and stop above. Keep
+                // the normal winner and tie handling before skipping it.
+                break;
+            }
         }
         let tokens = best.unwrap_or(tokens);
         if progress.is_some_and(|report| !report(end - start)) {
@@ -2718,6 +2728,10 @@ fn encode_tokens_with_allowance<B: Budget>(
     }
     Ok(tokens)
 }
+
+#[cfg(test)]
+#[path = "convergence_tests.rs"]
+mod convergence_tests;
 
 /// Decides whether a literal should be emitted instead of `current` because a
 /// better match starts within the lazy lookahead window. Also returns the
