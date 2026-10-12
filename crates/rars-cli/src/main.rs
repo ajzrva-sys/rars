@@ -763,6 +763,7 @@ struct ExtractOutputState<'a> {
     staging: Option<ExtractionStaging>,
     staged_paths: Vec<PathBuf>,
     hardlink_targets: HashMap<PathBuf, PathBuf>,
+    staged_redirections: HashSet<PathBuf>,
     staged_directories: HashSet<PathBuf>,
     directory_times: Vec<(PathBuf, std::time::SystemTime)>,
 }
@@ -779,6 +780,7 @@ impl<'a> ExtractOutputState<'a> {
             staging: None,
             staged_paths: Vec::new(),
             hardlink_targets: HashMap::new(),
+            staged_redirections: HashSet::new(),
             staged_directories: HashSet::new(),
             directory_times: Vec::new(),
         }
@@ -848,6 +850,7 @@ impl<'a> ExtractOutputState<'a> {
             &self.created_paths,
         )?;
         self.record_staged_path(&path, false)?;
+        self.staged_redirections.insert(path.clone());
         if let Some(target) =
             output::rar50_hardlink_source(redirection, meta.host_os, &self.created_paths)?
         {
@@ -973,6 +976,16 @@ impl<'a> ExtractOutputState<'a> {
             } else {
                 fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
                 output::checked_output_path(self.out_dir, relative)?;
+                if self.overwrite == OverwritePolicy::Always
+                    && self.staged_redirections.contains(staged)
+                {
+                    match fs::symlink_metadata(&destination) {
+                        Ok(metadata) if metadata.is_dir() => fs::remove_dir(&destination)?,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 let hardlink_target = self
                     .hardlink_targets
                     .get(staged)

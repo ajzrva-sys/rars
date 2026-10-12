@@ -97,6 +97,80 @@ fn checksum_failure_preserves_existing_files_and_cleans_staging() {
 }
 
 #[test]
+fn later_integrity_failure_preserves_empty_redirection_destination_directory() {
+    let root = scratch::case("extraction-redirection-directory-checksum");
+    let archive_path = root.join("archive.rar");
+    let fixture = rars::ArchiveReader::read_owned(
+        include_bytes!("../../rars/tests/fixtures/rar50/wild/hardlink.rar").to_vec(),
+    )
+    .unwrap();
+    let hardlink = fixture
+        .members()
+        .find(|member| member.meta.name == b"hardlink.txt")
+        .unwrap();
+    assert!(hardlink.supported_redirection().is_some());
+    let payload = b"unique later payload with a corrupt checksum";
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file.txt".to_vec(), b"test\n".to_vec(), None, None)
+        .unwrap();
+    builder.add_archive_redirection(&hardlink).unwrap();
+    builder
+        .add_bytes(b"later.txt".to_vec(), payload.to_vec(), None, None)
+        .unwrap();
+    let mut bytes = builder.to_bytes().unwrap();
+    let parsed = rars::rar50::Archive::parse(&bytes).unwrap();
+    assert_eq!(
+        parsed
+            .files()
+            .map(|file| file.name.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"file.txt"[..], &b"hardlink.txt"[..], &b"later.txt"[..]]
+    );
+    let later_range = parsed
+        .files()
+        .find(|file| file.name == b"later.txt")
+        .unwrap()
+        .block
+        .data_range
+        .clone();
+    assert_eq!(&bytes[later_range.clone()], payload);
+    fs::write(&archive_path, &bytes).unwrap();
+
+    // Prove the framed archive and preserved hardlink are valid before making
+    // only the later member fail. Its redirection precedes that member.
+    let control = root.join("control");
+    fs::create_dir_all(control.join("hardlink.txt")).unwrap();
+    let result = extract(&archive_path, &control, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(control.join("hardlink.txt")).unwrap(), b"test\n");
+    assert_eq!(fs::read(control.join("later.txt")).unwrap(), payload);
+
+    bytes[later_range.start] ^= 1;
+    fs::write(&archive_path, bytes).unwrap();
+    let destination = root.join("out");
+    let existing = destination.join("hardlink.txt");
+    fs::create_dir_all(&existing).unwrap();
+    let result = extract(&archive_path, &destination, &[]);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("while verifying entry 'later.txt'")
+            && String::from_utf8_lossy(&result.stderr).contains("hash mismatch"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(existing.is_dir());
+    assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+    assert!(!destination.join("file.txt").exists());
+    assert!(!destination.join("later.txt").exists());
+}
+
+#[test]
 fn limit_failure_preserves_existing_files_and_cleans_staging() {
     let root = scratch::case("extraction-limit-publication");
     let archive = root.join("archive.rar");

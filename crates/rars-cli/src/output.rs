@@ -985,6 +985,59 @@ mod tests {
     }
 
     #[test]
+    fn verified_redirection_publication_replaces_only_empty_directories() {
+        use super::*;
+        use std::io::Write;
+        let mut kinds = vec![FSREDIR_FILE_COPY, FSREDIR_HARDLINK];
+        if cfg!(unix) {
+            kinds.push(FSREDIR_UNIX_SYMLINK);
+        }
+        for kind in kinds {
+            for nonempty in [false, true] {
+                for overwrite in [OverwritePolicy::Never, OverwritePolicy::Always] {
+                    let root = scratch("verified-redirection-directory");
+                    let destination = root.join("destination");
+                    fs::create_dir(&destination).unwrap();
+                    if nonempty {
+                        fs::write(destination.join("keep"), b"keep").unwrap();
+                    }
+                    let mut state =
+                        crate::ExtractOutputState::new(&root, overwrite, ArchiveFamily::Rar50Plus);
+                    let (mut meta, mut redirection) = redirection_fixture();
+                    meta.name = b"source".to_vec();
+                    state
+                        .open_rar50_entry(&meta)
+                        .unwrap()
+                        .write_all(b"payload")
+                        .unwrap();
+                    meta.name = b"destination".to_vec();
+                    redirection.target_name = b"source".to_vec();
+                    redirection.redirection_type = kind;
+                    let staged = state.create_rar50_redirection(&meta, &redirection);
+                    assert!(
+                        destination.is_dir(),
+                        "destination changed before verification"
+                    );
+                    if overwrite == OverwritePolicy::Never {
+                        assert!(staged.is_err());
+                        assert!(!root.join("source").exists());
+                        continue;
+                    }
+                    staged.unwrap();
+                    let published = state.publish();
+                    if nonempty {
+                        assert!(published.is_err());
+                        assert_eq!(fs::read(destination.join("keep")).unwrap(), b"keep");
+                    } else {
+                        published.unwrap();
+                        assert_eq!(fs::read(&destination).unwrap(), b"payload");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn redirection_filesystem_and_path_errors_are_reported() {
         use super::*;
         let dir = scratch("redirection-errors");
