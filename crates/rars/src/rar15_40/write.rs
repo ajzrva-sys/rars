@@ -1282,7 +1282,13 @@ impl<'a> Member<'a> {
             unicode_name: None,
             unpack_version: None,
             extended_times: None,
-            is_directory: false,
+            // Streaming callers have no retained metadata wrapper. The native
+            // attribute word already distinguishes directory sources.
+            is_directory: if entry.host_os == 3 {
+                entry.file_attr & 0o170000 == 0o040000
+            } else {
+                entry.file_attr & 0x10 != 0
+            },
             is_symlink: false,
         }
     }
@@ -1330,6 +1336,9 @@ fn encode_member<'a>(
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
     if member.is_directory {
+        if unpacked_size != 0 {
+            return Err(Error::InvalidArgument("directory source must be empty"));
+        }
         return Ok(EncodedMember {
             payload: MemberPayload::Packed(Vec::new()),
             method: 0x30,
@@ -2972,6 +2981,32 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streaming_directory_sources_cannot_discard_payloads() {
+        for (host_os, attributes) in [(3, 0o040750), (2, 0x10)] {
+            let entry = super::StreamingEntry::new(
+                b"directory".to_vec(),
+                crate::EntrySource::from_bytes(b"must not be discarded".to_vec()),
+            )
+            .with_host_os(host_os)
+            .with_file_attr(attributes);
+            let error = super::write_streaming_archive_to(
+                &[entry],
+                super::WriterOptions::new(
+                    crate::ArchiveVersion::Rar30,
+                    crate::FeatureSet::store_only(),
+                ),
+                crate::MemberCoding::Stored,
+                None,
+                &crate::WriterResources::default(),
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("directory source must be empty"));
+        }
+    }
+
     #[test]
     fn encrypted_payload_padding_preserves_cipher_state_across_chunks() {
         for target in [crate::ArchiveVersion::Rar20, crate::ArchiveVersion::Rar30] {

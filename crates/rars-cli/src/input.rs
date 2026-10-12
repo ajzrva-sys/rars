@@ -19,6 +19,7 @@ pub(crate) struct OwnedInput {
 }
 
 pub(crate) struct LazyInput {
+    pub(crate) is_directory: bool,
     pub(crate) path: PathBuf,
     pub(crate) name: Vec<u8>,
     pub(crate) size: u64,
@@ -26,6 +27,16 @@ pub(crate) struct LazyInput {
     pub(crate) unix_mode: Option<u32>,
     pub(crate) unix_mtime: Option<u32>,
     pub(crate) dos_mtime: u32,
+}
+
+impl LazyInput {
+    pub(crate) fn source(&self) -> rars::EntrySource {
+        if self.is_directory {
+            rars::EntrySource::from_bytes(Vec::new())
+        } else {
+            rars::EntrySource::from_path(self.path.clone())
+        }
+    }
 }
 
 pub(crate) fn collect_inputs(paths: &[PathBuf]) -> CliResult<Vec<LazyInput>> {
@@ -36,7 +47,7 @@ pub(crate) fn collect_inputs(paths: &[PathBuf]) -> CliResult<Vec<LazyInput>> {
         collect_input(path, &base, &mut pending)?;
     }
     if pending.is_empty() {
-        return Err("no regular input files found".into());
+        return Err("no input files or directories found".into());
     }
     reject_duplicate_input_names(pending.iter().map(|entry| entry.name.as_slice()))?;
     Ok(pending)
@@ -56,8 +67,11 @@ where
     discovered(pending.len(), pending.iter().map(|entry| entry.size).sum());
     let mut out = Vec::with_capacity(pending.len());
     for entry in pending {
-        let data =
-            read_file_with_progress(&entry.path, "input", |bytes| advanced(bytes, &entry.name))?;
+        let data = if entry.is_directory {
+            Vec::new()
+        } else {
+            read_file_with_progress(&entry.path, "input", |bytes| advanced(bytes, &entry.name))?
+        };
         out.push(OwnedInput {
             name: entry.name,
             data,
@@ -80,6 +94,28 @@ fn collect_input(path: &Path, archive_name: &Path, out: &mut Vec<LazyInput>) -> 
         )
         .into());
     }
+    if meta.is_dir() || meta.is_file() {
+        out.push(LazyInput {
+            is_directory: meta.is_dir(),
+            path: path.to_path_buf(),
+            name: archive_path_bytes(archive_name)?,
+            size: if meta.is_dir() { 0 } else { meta.len() },
+            file_attr: if meta.is_dir() {
+                0x10
+            } else {
+                DOS_ARCHIVE_ATTR
+            },
+            unix_mode: source_unix_mode(&meta),
+            unix_mtime: source_unix_mtime(&meta),
+            dos_mtime: source_dos_mtime(&meta),
+        });
+    } else {
+        return Err(format!(
+            "input '{}' is not a regular file or directory",
+            path.display()
+        )
+        .into());
+    }
     if meta.is_dir() {
         let mut children = fs::read_dir(path)
             .map_err(|err| format!("failed to read directory '{}': {err}", path.display()))?
@@ -91,22 +127,6 @@ fn collect_input(path: &Path, archive_name: &Path, out: &mut Vec<LazyInput>) -> 
             let child_name = archive_name.join(child.file_name());
             collect_input(&child_path, &child_name, out)?;
         }
-    } else if meta.is_file() {
-        let unix_mtime = source_unix_mtime(&meta);
-        let dos_mtime = source_dos_mtime(&meta);
-        let unix_mode = source_unix_mode(&meta);
-        let name = archive_path_bytes(archive_name)?;
-        out.push(LazyInput {
-            path: path.to_path_buf(),
-            name,
-            size: meta.len(),
-            file_attr: DOS_ARCHIVE_ATTR,
-            unix_mode,
-            unix_mtime,
-            dos_mtime,
-        });
-    } else {
-        return Err(format!("input '{}' is not a regular file", path.display()).into());
     }
     Ok(())
 }
@@ -203,14 +223,10 @@ mod tests {
     #[test]
     fn collection_rejects_empty_unsafe_missing_and_duplicate_inputs() {
         let root = crate::scratch::case("input-collection-errors");
-        let empty = root.join("empty");
-        fs::create_dir(&empty).unwrap();
-        for paths in [vec![], vec![empty]] {
-            assert_eq!(
-                collect_inputs(&paths).err().unwrap().to_string(),
-                "no regular input files found"
-            );
-        }
+        assert_eq!(
+            collect_inputs(&[]).err().unwrap().to_string(),
+            "no input files or directories found"
+        );
         for path in ["", ".", "./"] {
             assert_eq!(
                 collect_inputs(&[PathBuf::from(path)])
@@ -264,7 +280,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(error.to_string(), "no regular input files found");
+        assert_eq!(error.to_string(), "no input files or directories found");
         #[cfg(unix)]
         assert_eq!(
             input_archive_base(Path::new("/")).unwrap_err().to_string(),
@@ -318,20 +334,31 @@ mod tests {
             std::slice::from_ref(&input),
             Some(b"secret"),
             |count, bytes| {
-                assert_eq!((count, bytes), (2, payload.len() as u64));
+                assert_eq!((count, bytes), (4, payload.len() as u64));
                 events.borrow_mut().push((bytes, Vec::new()));
             },
             |bytes, name| events.borrow_mut().push((bytes, name.to_vec())),
         )
         .unwrap();
-        assert_eq!(owned.len(), 2);
-        assert_eq!(owned[0].name, b"input/a-empty");
+        assert_eq!(owned.len(), 4);
+        assert_eq!(owned[0].name, b"input");
         assert!(owned[0].data.is_empty());
-        assert_eq!(owned[1].name, b"input/nested/z-data");
-        assert_eq!(owned[1].data, payload);
+        assert_eq!(owned[1].name, b"input/a-empty");
+        assert!(owned[1].data.is_empty());
+        assert_eq!(owned[2].name, b"input/nested");
+        assert!(owned[2].data.is_empty());
+        assert_eq!(owned[3].name, b"input/nested/z-data");
+        assert_eq!(owned[3].data, payload);
         for (owned, lazy) in owned.iter().zip(lazy) {
             assert_eq!(owned.name, lazy.name);
-            assert_eq!(owned.file_attr, DOS_ARCHIVE_ATTR);
+            assert_eq!(
+                owned.file_attr,
+                if lazy.is_directory {
+                    0x10
+                } else {
+                    DOS_ARCHIVE_ATTR
+                }
+            );
             assert_eq!(owned.unix_mode, lazy.unix_mode);
             assert_eq!(owned.dos_mtime, lazy.dos_mtime);
             assert_eq!(owned.password.as_deref().unwrap().as_slice(), b"secret");
@@ -424,10 +451,16 @@ mod tests {
         let root = crate::scratch::case("cli-non-utf8-name");
         let input = root.join("input");
         fs::create_dir(&input).unwrap();
+        if !crate::scratch::supports_raw_byte_names(&root) {
+            // The filesystem rejects this input before the CLI can collect it.
+            assert!(fs::write(input.join(OsStr::from_bytes(b"bad-\xff")), b"payload").is_err());
+            assert_eq!(collect_inputs(&[input]).unwrap().len(), 1);
+            return;
+        }
         fs::write(input.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
         let entries = collect_inputs(&[input]).unwrap();
-        assert_eq!(entries[0].name, b"input/bad-\xff");
-        assert_eq!(fs::read(&entries[0].path).unwrap(), b"payload");
+        assert_eq!(entries[1].name, b"input/bad-\xff");
+        assert_eq!(fs::read(&entries[1].path).unwrap(), b"payload");
     }
 
     #[test]
@@ -441,8 +474,10 @@ mod tests {
         }
         names.sort();
         let entries = collect_inputs(std::slice::from_ref(&input)).unwrap();
-        assert_eq!(entries.len(), names.len());
-        for (entry, name) in entries.iter().zip(names) {
+        assert_eq!(entries.len(), names.len() + 2);
+        assert!(entries[0].is_directory);
+        assert!(entries[1].is_directory);
+        for (entry, name) in entries[2..].iter().zip(names) {
             assert_eq!(entry.name, format!("input/日本語/{name}").as_bytes());
             assert_eq!(entry.path, input.join("日本語").join(name));
             assert_eq!(fs::read(&entry.path).unwrap(), name.as_bytes());

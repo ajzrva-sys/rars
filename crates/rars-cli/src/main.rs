@@ -56,6 +56,10 @@ use volumes::{
 
 const DOS_ARCHIVE_ATTR: u8 = 0x20;
 #[cfg(windows)]
+const RAR15_HOST_NATIVE: u8 = 2;
+#[cfg(not(windows))]
+const RAR15_HOST_NATIVE: u8 = 3;
+#[cfg(windows)]
 const RAR50_HOST_NATIVE: u64 = 0;
 #[cfg(not(windows))]
 const RAR50_HOST_NATIVE: u64 = 1;
@@ -1296,7 +1300,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     let inputs = collect_inputs(input_paths)?;
     let total: u64 = inputs.iter().map(|entry| entry.size).sum();
     progress.finish(format!(
-        "Found {} files ({})",
+        "Found {} entries ({})",
         inputs.len(),
         indicatif::HumanBytes(total)
     ));
@@ -1337,13 +1341,11 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 let entries: Vec<_> = inputs
                     .iter()
                     .map(|input| {
-                        let entry = rars::rar15_40::StreamingEntry::new(
-                            input.name.clone(),
-                            rars::EntrySource::from_path(input.path.clone()),
-                        )
-                        .with_file_time(input.dos_mtime)
-                        .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
-                        .with_host_os(3);
+                        let entry =
+                            rars::rar15_40::StreamingEntry::new(input.name.clone(), input.source())
+                                .with_file_time(input.dos_mtime)
+                                .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
+                                .with_host_os(RAR15_HOST_NATIVE);
                         let entry = match file_comment.as_deref() {
                             Some(comment) => entry.with_file_comment(comment.to_vec()),
                             None => entry,
@@ -1384,12 +1386,10 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 let entries: Vec<_> = inputs
                     .iter()
                     .map(|input| {
-                        let entry = rars::rar13::StreamingEntry::new(
-                            input.name.clone(),
-                            rars::EntrySource::from_path(input.path.clone()),
-                        )
-                        .with_file_time(input.dos_mtime)
-                        .with_file_attr(input.file_attr);
+                        let entry =
+                            rars::rar13::StreamingEntry::new(input.name.clone(), input.source())
+                                .with_file_time(input.dos_mtime)
+                                .with_file_attr(input.file_attr);
                         let entry = match file_comment.as_deref() {
                             Some(comment) => entry.with_file_comment(comment.to_vec()),
                             None => entry,
@@ -1486,6 +1486,10 @@ struct LegacyVolumeWrite<'a> {
 }
 
 fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> CliResult<()> {
+    let inputs = collect_inputs(plan.input_paths)?;
+    if inputs.len() != 1 || inputs[0].is_directory {
+        return Err("multivolume writer supports one regular input file".into());
+    }
     warn_if_buffered_write_is_large(plan.input_paths, plan.target);
     progress.spinner("Scanning inputs");
     let owned = read_inputs_with_progress(
@@ -1497,8 +1501,14 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
             progress.advance(bytes);
         },
     )?;
-    // Invariant: one input, checked before anything was read.
-    let entry = owned.first().expect("one input checked above");
+    // Collection runs again while reading; check it too so an input tree that
+    // changed since preflight cannot silently lose every member after the first.
+    let [entry] = owned.as_slice() else {
+        return Err("multivolume writer supports one regular input file".into());
+    };
+    if entry.file_attr & 0x10 != 0 {
+        return Err("multivolume writer supports one regular input file".into());
+    }
     progress.finish(format!(
         "Read 1 file ({})",
         indicatif::HumanBytes(entry.data.len() as u64)
@@ -1529,7 +1539,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
                         data: &entry.data,
                         file_time: entry.dos_mtime,
                         file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
-                        host_os: 3,
+                        host_os: RAR15_HOST_NATIVE,
                         password,
                         file_comment: plan.file_comment,
                     },
@@ -1544,7 +1554,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
                         data: &entry.data,
                         file_time: entry.dos_mtime,
                         file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
-                        host_os: 3,
+                        host_os: RAR15_HOST_NATIVE,
                         password,
                         file_comment: plan.file_comment,
                     },
@@ -1623,27 +1633,28 @@ fn write_plain_rar50_streaming(
     let inputs = collect_inputs(input_paths)?;
     let total: u64 = inputs.iter().map(|entry| entry.size).sum();
     progress.finish(format!(
-        "Found {} files ({})",
+        "Found {} entries ({})",
         inputs.len(),
         indicatif::HumanBytes(total)
     ));
     let entries: Vec<_> = inputs
         .into_iter()
         .map(|entry| {
+            let source = entry.source();
             let name = if cfg!(unix) {
                 rars::filename::encode_rar50(&entry.name).into_owned()
             } else {
                 entry.name
             };
-            let entry =
-                rars::rar50::ArchiveEntry::new(name, rars::EntrySource::from_path(entry.path))
-                    .with_mtime(entry.unix_mtime)
-                    .with_attributes(u64::from(
-                        entry
-                            .unix_mode
-                            .unwrap_or_else(|| u32::from(entry.file_attr)),
-                    ))
-                    .with_host_os(RAR50_HOST_NATIVE);
+            let entry = rars::rar50::ArchiveEntry::new(name, source)
+                .with_directory(entry.is_directory)
+                .with_mtime(entry.unix_mtime)
+                .with_attributes(u64::from(
+                    entry
+                        .unix_mode
+                        .unwrap_or_else(|| u32::from(entry.file_attr)),
+                ))
+                .with_host_os(RAR50_HOST_NATIVE);
             let entry = match file_comment {
                 Some(comment) => entry.with_service(rars::rar50::ServiceEntry::new(
                     b"CMT".to_vec(),

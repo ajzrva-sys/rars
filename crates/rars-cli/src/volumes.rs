@@ -398,9 +398,22 @@ mod tests {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         let dir = crate::scratch::case("native-volume-names");
-        let first = dir.join(OsStr::from_bytes(b"set-\xff.part01.rar"));
-        let second = dir.join(OsStr::from_bytes(b"set-\xff.part02.rar"));
-        let other = dir.join(OsStr::from_bytes(b"set-\xfe.part01.rar"));
+        let raw_names = crate::scratch::supports_raw_byte_names(&dir);
+        let first = dir.join(OsStr::from_bytes(if raw_names {
+            b"set-\xff.part01.rar"
+        } else {
+            "set-\u{fffd}.part01.rar".as_bytes()
+        }));
+        let second = dir.join(OsStr::from_bytes(if raw_names {
+            b"set-\xff.part02.rar"
+        } else {
+            "set-\u{fffd}.part02.rar".as_bytes()
+        }));
+        let other = dir.join(OsStr::from_bytes(if raw_names {
+            b"set-\xfe.part01.rar"
+        } else {
+            "set-\u{fffc}.part01.rar".as_bytes()
+        }));
         for path in [&first, &second, &other] {
             fs::write(path, []).unwrap();
         }

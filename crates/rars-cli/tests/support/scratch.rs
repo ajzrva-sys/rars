@@ -103,3 +103,29 @@ fn target_dir() -> PathBuf {
         .unwrap_or(manifest)
         .join("target")
 }
+
+/// Probe the test filesystem rather than assuming every Unix volume accepts
+/// non-Unicode filenames. APFS/HFS+ can reject them even on a Unix host.
+#[cfg(unix)]
+#[allow(dead_code)] // This support module is also included by targets without filename tests.
+pub fn supports_raw_byte_names(root: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let path = root.join(OsStr::from_bytes(b"raw-name-probe-\xff"));
+    match std::fs::write(&path, []) {
+        Ok(()) => {
+            let exact_name = std::fs::read_dir(root)
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name().as_bytes() == b"raw-name-probe-\xff");
+            std::fs::remove_file(path).unwrap();
+            exact_name
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::InvalidInput
+                || error.raw_os_error() == Some(libc::EILSEQ) =>
+        {
+            false
+        }
+        Err(error) => panic!("raw filename probe failed unexpectedly: {error}"),
+    }
+}
