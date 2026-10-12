@@ -893,10 +893,8 @@ fn duplicate_archive_entries_are_refused_even_when_overwriting_is_allowed() {
             "{}",
             stderr(&output)
         );
-        assert_eq!(
-            fs::read(destination.join("duplicate.txt")).unwrap(),
-            b"first contents"
-        );
+        assert!(!destination.join("duplicate.txt").exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
     }
 }
 

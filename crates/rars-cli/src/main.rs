@@ -24,7 +24,7 @@ use output::{
     create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
     output_path_for_entry, output_path_for_rar50_entry, print_ok_entry, rar50_entry_name,
     rar50_output_relative_path, restore_output_metadata, warn_rar50_redirections, Backslash,
-    ExtractedOutput, OverwritePolicy,
+    ExtractedOutput, ExtractionStaging, OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -705,7 +705,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                 )
             })
         })?;
-        let outputs = state.into_inner().outputs;
+        let outputs = state.into_inner().publish()?;
         restore_output_metadata(&outputs).map_err(|err| {
             CliError::general(format!(
                 "failed to restore extracted metadata under '{}': {err}",
@@ -739,7 +739,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                 )
             })
         })?;
-        let outputs = state.into_inner().outputs;
+        let outputs = state.into_inner().publish()?;
         restore_output_metadata(&outputs).map_err(|err| {
             CliError::general(format!(
                 "failed to restore extracted metadata under '{}': {err}",
@@ -760,6 +760,11 @@ struct ExtractOutputState<'a> {
     outputs: Vec<ExtractedOutput>,
     planned_paths: HashSet<PathBuf>,
     created_paths: HashMap<PathBuf, PathBuf>,
+    staging: Option<ExtractionStaging>,
+    staged_paths: Vec<PathBuf>,
+    hardlink_targets: HashMap<PathBuf, PathBuf>,
+    staged_directories: HashSet<PathBuf>,
+    directory_times: Vec<(PathBuf, std::time::SystemTime)>,
 }
 
 impl<'a> ExtractOutputState<'a> {
@@ -771,17 +776,26 @@ impl<'a> ExtractOutputState<'a> {
             outputs: Vec::new(),
             planned_paths: HashSet::new(),
             created_paths: HashMap::new(),
+            staging: None,
+            staged_paths: Vec::new(),
+            hardlink_targets: HashMap::new(),
+            staged_directories: HashSet::new(),
+            directory_times: Vec::new(),
         }
     }
 
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         let planned = output_path_for_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
+        let destination = output_path_for_entry(self.out_dir, meta)?;
+        self.remember_directory_time(&destination, meta)?;
+        let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
         let (path, writer) =
-            open_output_writer(self.out_dir, meta, self.overwrite, Backslash::Separator)?;
+            open_output_writer(&staging, meta, OverwritePolicy::Never, Backslash::Separator)?;
+        self.record_staged_path(&path, meta.is_directory)?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
-            path,
+            path: destination,
             meta: meta.clone(),
             family: self.family,
             restore_metadata: true,
@@ -796,12 +810,20 @@ impl<'a> ExtractOutputState<'a> {
         let common = rar50_extracted_meta(meta);
         let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
-        let (path, writer) =
-            open_output_writer(self.out_dir, &common, self.overwrite, Backslash::Literal)?;
+        let destination = output_path_for_rar50_entry(self.out_dir, meta)?;
+        self.remember_directory_time(&destination, &common)?;
+        let staging = self.prepare_staged_path(&destination, common.is_directory)?;
+        let (path, writer) = open_output_writer(
+            &staging,
+            &common,
+            OverwritePolicy::Never,
+            Backslash::Literal,
+        )?;
+        self.record_staged_path(&path, common.is_directory)?;
         self.record_rar50_created_path(meta, path.clone())?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
-            path,
+            path: destination,
             meta: common,
             family: self.family,
             restore_metadata: true,
@@ -816,17 +838,26 @@ impl<'a> ExtractOutputState<'a> {
     ) -> rars::Result<()> {
         let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
+        let destination = output_path_for_rar50_entry(self.out_dir, meta)?;
+        let staging = self.prepare_staged_path(&destination, false)?;
         let (path, restore_metadata) = create_rar50_redirection_output(
-            self.out_dir,
+            &staging,
             meta,
             redirection,
-            self.overwrite,
+            OverwritePolicy::Never,
             &self.created_paths,
         )?;
+        self.record_staged_path(&path, false)?;
+        if let Some(target) =
+            output::rar50_hardlink_source(redirection, meta.host_os, &self.created_paths)?
+        {
+            self.hardlink_targets
+                .insert(path.clone(), target.to_path_buf());
+        }
         self.record_rar50_created_path(meta, path.clone())?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
-            path,
+            path: destination,
             meta: rar50_extracted_meta(meta),
             family: self.family,
             restore_metadata,
@@ -841,6 +872,131 @@ impl<'a> ExtractOutputState<'a> {
             ));
         }
         Ok(())
+    }
+
+    fn prepare_staged_path(
+        &mut self,
+        destination: &Path,
+        directory: bool,
+    ) -> rars::Result<PathBuf> {
+        if !directory
+            && self.overwrite == OverwritePolicy::Never
+            && fs::symlink_metadata(destination).is_ok()
+        {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File exists").into(),
+            );
+        }
+        if self.staging.is_none() {
+            self.staging = Some(ExtractionStaging::new(self.out_dir)?);
+        }
+        let root = &self.staging.as_ref().expect("staging exists").root;
+        self.staging
+            .as_ref()
+            .expect("staging exists")
+            .reject_alias(destination)?;
+        let relative = destination
+            .strip_prefix(self.out_dir)
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+        if destination.starts_with(root) {
+            return Err(rars::Error::InvalidHeader(
+                "archive path conflicts with extraction storage",
+            ));
+        }
+        let staged = root.join(relative);
+        if let Ok(metadata) = fs::symlink_metadata(&staged) {
+            let explicit_directory = metadata.is_dir()
+                && self
+                    .staged_directories
+                    .contains(&fs::canonicalize(&staged)?);
+            if !metadata.is_dir() || !directory || explicit_directory {
+                return Err(rars::Error::InvalidHeader(
+                    "multiple archive entries map to the same output path",
+                ));
+            }
+        }
+        Ok(root.clone())
+    }
+
+    fn record_staged_path(&mut self, path: &Path, directory: bool) -> rars::Result<()> {
+        if directory {
+            self.staged_directories.insert(fs::canonicalize(path)?);
+        }
+        self.staged_paths.push(path.to_path_buf());
+        Ok(())
+    }
+
+    fn remember_directory_time(
+        &mut self,
+        destination: &Path,
+        meta: &rars::ExtractedEntryMeta,
+    ) -> rars::Result<()> {
+        if meta.is_directory
+            && time::extracted_system_time(self.family, meta.file_time, meta.mtime_refinement)
+                .is_none()
+        {
+            match fs::metadata(destination) {
+                Ok(metadata) if metadata.is_dir() => self
+                    .directory_times
+                    .push((destination.to_path_buf(), metadata.modified()?)),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn publish(self) -> rars::Result<Vec<ExtractedOutput>> {
+        // Decoding and checksum verification have succeeded for the complete call.
+        // Publish new inodes rather than truncating any existing hard-link target.
+        let mut published = HashSet::new();
+        let mut published_paths = HashMap::new();
+        for (output, staged) in self.outputs.iter().zip(&self.staged_paths) {
+            let relative = output
+                .path
+                .strip_prefix(self.out_dir)
+                .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+            let destination = output::checked_output_path(self.out_dir, relative)?;
+            if let Some(staging) = &self.staging {
+                staging.reject_alias(&destination)?;
+            }
+            if let Ok(identity) = fs::canonicalize(&destination) {
+                if published.contains(&identity) {
+                    return Err(rars::Error::InvalidHeader(
+                        "multiple archive entries map to the same output path",
+                    ));
+                }
+            }
+            if fs::symlink_metadata(staged)?.is_dir() {
+                fs::create_dir_all(&destination)?;
+            } else {
+                fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
+                output::checked_output_path(self.out_dir, relative)?;
+                let hardlink_target = self
+                    .hardlink_targets
+                    .get(staged)
+                    .and_then(|target| published_paths.get(target))
+                    .map(PathBuf::as_path);
+                output::publish_verified_output(
+                    staged,
+                    &destination,
+                    self.overwrite,
+                    hardlink_target,
+                )?;
+            }
+            published_paths.insert(staged.clone(), destination.clone());
+            // Symlinks may be dangling; their destination entries were reserved above.
+            if let Ok(identity) = fs::canonicalize(&destination) {
+                if !fs::symlink_metadata(&destination)?.file_type().is_symlink() {
+                    published.insert(identity);
+                }
+            }
+        }
+        for (path, modified) in &self.directory_times {
+            output::set_modified_time(path, *modified)?;
+        }
+        Ok(self.outputs)
     }
 
     fn record_rar50_created_path(
@@ -2191,6 +2347,7 @@ mod tests {
             &state,
         )
         .unwrap();
+        state.into_inner().publish().unwrap();
         assert_eq!(
             std::fs::read_link(root.join("symlink.txt")).unwrap(),
             std::path::PathBuf::from("file.txt")
@@ -2239,6 +2396,7 @@ mod tests {
             &state,
         )
         .unwrap();
+        state.into_inner().publish().unwrap();
         assert_eq!(
             std::fs::read(root.join("新建文本文档.txt")).unwrap(),
             b"aaaaaaaaaa"

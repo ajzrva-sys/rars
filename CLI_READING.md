@@ -36,6 +36,12 @@ increase the limit if a worker's share is insufficient. See the
 [reader resource contract](READER_RESOURCE_CONTRACT.md) for capacity accounting,
 exclusions and failure behavior. None of these options limits process RAM.
 
-A limit failure can leave earlier extracted members or a failing member's
-prefix. An unknown-size logical RAR5 member is refused when a member-output
-limit is configured; this does not add decode-to-end support.
+The CLI stages member output privately and publishes it after the complete
+decoding call passes checksum verification. A decoding or limit failure leaves
+existing destination files intact and removes staged output. Publication can
+still leave earlier members if a later filesystem operation fails. Overwrites
+replace destination entries rather than truncating existing hard-link targets.
+Names which collide on the staging or destination filesystem are refused even
+with `--overwrite=always`. Caller-owned library sinks retain their documented
+streaming failure behavior. An unknown-size logical RAR5 member is refused when
+a member-output limit is configured; this does not add decode-to-end support.

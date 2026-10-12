@@ -7,7 +7,76 @@ use rars::{
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+/// Private, same-filesystem storage for a verified extraction's pending outputs.
+pub(crate) struct ExtractionStaging {
+    pub(crate) root: PathBuf,
+}
+
+impl ExtractionStaging {
+    pub(crate) fn new(out_dir: &Path) -> std::io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        fs::create_dir_all(out_dir)?;
+        for _ in 0..128 {
+            let root = out_dir.join(format!(
+                ".rars-extract-{}-{:016x}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&root) {
+                Ok(()) => return Ok(Self { root }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create private extraction storage",
+        ))
+    }
+
+    pub(crate) fn reject_alias(&self, destination: &Path) -> rars::Result<()> {
+        let storage = fs::canonicalize(&self.root)?;
+        let mut ancestor = Some(destination);
+        while let Some(path) = ancestor {
+            match fs::canonicalize(path) {
+                Ok(identity) => {
+                    if identity.starts_with(&storage) {
+                        return Err(Error::InvalidHeader(
+                            "archive path conflicts with extraction storage",
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    ancestor = path.parent();
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExtractionStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OverwritePolicy {
@@ -188,6 +257,18 @@ fn redirection_source_path<'a>(
         ))
 }
 
+pub(crate) fn rar50_hardlink_source<'a>(
+    redirection: &rars::rar50::FileRedirection,
+    host_os: u64,
+    created_paths: &'a HashMap<PathBuf, PathBuf>,
+) -> rars::Result<Option<&'a Path>> {
+    if redirection.redirection_type == FSREDIR_HARDLINK {
+        redirection_source_path(redirection, host_os, created_paths).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn prepare_redirection_destination(path: &Path, overwrite: OverwritePolicy) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => match overwrite {
@@ -274,7 +355,7 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
 }
 
 #[cfg(windows)]
-fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
+pub(crate) fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
@@ -288,7 +369,7 @@ fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
+pub(crate) fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
     File::open(path)?.set_modified(time)
 }
 
@@ -431,6 +512,106 @@ fn create_output_file(path: &Path, overwrite: OverwritePolicy) -> std::io::Resul
     options.open(path)
 }
 
+fn copy_verified_output(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let file_type = fs::symlink_metadata(source)?.file_type();
+    if file_type.is_symlink() {
+        #[cfg(windows)]
+        let flags = {
+            use std::os::windows::fs::FileTypeExt;
+            if file_type.is_symlink_dir() {
+                FHEXTRA_REDIR_DIR
+            } else {
+                0
+            }
+        };
+        #[cfg(not(windows))]
+        let flags = 0;
+        return create_symlink_redirection(&fs::read_link(source)?, destination, flags);
+    }
+    let mut output = create_output_file(destination, OverwritePolicy::Never)?;
+    std::io::copy(&mut File::open(source)?, &mut output)?;
+    Ok(())
+}
+
+fn publish_no_replace(
+    source: &Path,
+    destination: &Path,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // Directory symlinks cannot be published using Windows hard-link APIs.
+    if fs::symlink_metadata(source)?.file_type().is_symlink() {
+        return copy_verified_output(source, destination);
+    }
+    match link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+        // Includes filesystems without hard links and nested destination mounts.
+        // create_new retains the no-overwrite guarantee in this fallback.
+        Err(_) => copy_verified_output(source, destination),
+    }
+}
+
+pub(crate) fn publish_verified_output(
+    source: &Path,
+    destination: &Path,
+    overwrite: OverwritePolicy,
+    hardlink_target: Option<&Path>,
+) -> rars::Result<()> {
+    publish_verified_output_with_rename(
+        source,
+        destination,
+        overwrite,
+        hardlink_target,
+        |from, to| fs::rename(from, to),
+    )
+}
+
+fn publish_verified_output_with_rename(
+    source: &Path,
+    destination: &Path,
+    overwrite: OverwritePolicy,
+    hardlink_target: Option<&Path>,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> rars::Result<()> {
+    match overwrite {
+        OverwritePolicy::Never => publish_no_replace(source, destination, |from, to| {
+            fs::hard_link(hardlink_target.unwrap_or(from), to)
+        })?,
+        OverwritePolicy::Always => match rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                // Stage on this destination's filesystem before atomic replacement.
+                let staging = ExtractionStaging::new(
+                    destination.parent().expect("validated path has parent"),
+                )?;
+                let local = staging.root.join("payload");
+                // Preserve archive hardlinks when the earlier target was also
+                // published onto this destination's mounted filesystem.
+                let linked =
+                    hardlink_target.is_some_and(|target| fs::hard_link(target, &local).is_ok());
+                if !linked {
+                    copy_verified_output(source, &local)?;
+                }
+                rename(&local, destination)?;
+            }
+            Err(error) => return Err(error.into()),
+        },
+    }
+    remove_staged_output(source)?;
+    Ok(())
+}
+
+fn remove_staged_output(source: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if fs::symlink_metadata(source)?.file_type().is_symlink_dir() {
+            return fs::remove_dir(source);
+        }
+    }
+    fs::remove_file(source)
+}
+
 #[cfg(unix)]
 fn set_no_follow(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -455,6 +636,196 @@ mod tests {
 
     fn scratch(name: &str) -> crate::scratch::Scratch {
         crate::scratch::case(&format!("rars-output-{name}"))
+    }
+
+    #[test]
+    fn verified_copy_fallback_keeps_no_overwrite_without_hardlinks() {
+        use super::*;
+        let root = scratch("no-hardlink-publication");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, b"verified bytes").unwrap();
+        let unsupported =
+            |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        publish_no_replace(&source, &destination, unsupported).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"verified bytes");
+        fs::write(&source, b"replacement").unwrap();
+        assert_eq!(
+            publish_no_replace(&source, &destination, unsupported)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"verified bytes");
+    }
+
+    #[test]
+    fn cross_device_publication_stages_beside_the_destination() {
+        use super::*;
+        let root = scratch("cross-device-publication");
+        let source = root.join("source");
+        let parent = root.join("other-mount");
+        fs::create_dir(&parent).unwrap();
+        let destination = parent.join("destination");
+        fs::write(&source, b"verified bytes").unwrap();
+        fs::write(&destination, b"old contents").unwrap();
+        let mut calls = 0;
+        publish_verified_output_with_rename(
+            &source,
+            &destination,
+            OverwritePolicy::Always,
+            None,
+            |from, to| {
+                calls += 1;
+                if calls == 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices));
+                }
+                assert!(from.starts_with(&parent));
+                assert_eq!(fs::read(to).unwrap(), b"old contents");
+                fs::rename(from, to)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(fs::read(&destination).unwrap(), b"verified bytes");
+        assert!(!source.exists());
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_publication_preserves_archive_hardlinks() {
+        use super::*;
+        use std::os::unix::fs::MetadataExt;
+        for overwrite in [OverwritePolicy::Never, OverwritePolicy::Always] {
+            let root = scratch("cross-device-hardlinks");
+            let staging = ExtractionStaging::new(&root).unwrap();
+            let source = staging.root.join("source");
+            let source_link = staging.root.join("link");
+            fs::write(&source, b"verified bytes").unwrap();
+            fs::hard_link(&source, &source_link).unwrap();
+            let parent = root.join("other-mount");
+            fs::create_dir(&parent).unwrap();
+            let target = parent.join("target");
+            let destination = parent.join("link");
+            // Force the ordinary target through the cross-device copy path.
+            publish_verified_output_with_rename(
+                &source,
+                &target,
+                OverwritePolicy::Always,
+                None,
+                |from, to| {
+                    if from.starts_with(&staging.root) {
+                        Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+                    } else {
+                        fs::rename(from, to)
+                    }
+                },
+            )
+            .unwrap();
+            publish_verified_output_with_rename(
+                &source_link,
+                &destination,
+                overwrite,
+                Some(&target),
+                |from, to| {
+                    if from.starts_with(&staging.root) {
+                        Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+                    } else {
+                        fs::rename(from, to)
+                    }
+                },
+            )
+            .unwrap();
+            let original = fs::metadata(&target).unwrap();
+            let linked = fs::metadata(&destination).unwrap();
+            assert_eq!(
+                (original.dev(), original.ino()),
+                (linked.dev(), linked.ino())
+            );
+            assert_eq!(fs::read(destination).unwrap(), b"verified bytes");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn publication_cleans_staged_directory_symlinks() {
+        use super::*;
+        for overwrite in [OverwritePolicy::Never, OverwritePolicy::Always] {
+            let root = scratch("directory-symlink-publication");
+            let directory = root.join("directory");
+            fs::create_dir(&directory).unwrap();
+            let source = root.join("source-link");
+            let destination = root.join("published-link");
+            let result = create_symlink_redirection(&directory, &source, 1);
+            #[cfg(windows)]
+            if result
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(1314))
+            {
+                // Windows hosts without symlink privileges cannot exercise this API.
+                return;
+            }
+            result.unwrap();
+            let mut calls = 0;
+            publish_verified_output_with_rename(
+                &source,
+                &destination,
+                overwrite,
+                None,
+                |from, to| {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+                    } else {
+                        fs::rename(from, to)
+                    }
+                },
+            )
+            .unwrap();
+            assert!(fs::symlink_metadata(source).is_err());
+            assert_eq!(fs::read_link(destination).unwrap(), directory);
+        }
+    }
+
+    #[test]
+    fn staging_aliases_are_rejected_using_existing_filesystem_ancestors() {
+        use super::*;
+        let root = scratch("staging-alias");
+        let mut state = crate::ExtractOutputState::new(
+            &root,
+            OverwritePolicy::Always,
+            ArchiveFamily::Rar50Plus,
+        );
+        state
+            .open_entry(&rars::ExtractedEntryMeta::new(
+                b"ordinary".to_vec(),
+                None,
+                0,
+                false,
+            ))
+            .unwrap();
+        let storage = state.staging.as_ref().unwrap().root.clone();
+        let alias = storage
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_uppercase();
+        // On a case-sensitive host this distinct name is a legitimate output.
+        let aliases_storage = root.join(&alias).exists();
+        let name = format!("{alias}/payload").into_bytes();
+        let result = state.open_entry(&rars::ExtractedEntryMeta::new(name, None, 0, false));
+        if aliases_storage {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidHeader(
+                    "archive path conflicts with extraction storage"
+                ))
+            ));
+            assert_eq!(fs::read_dir(&storage).unwrap().count(), 1);
+        } else {
+            assert!(result.is_ok());
+        }
     }
 
     #[test]
@@ -810,6 +1181,7 @@ mod tests {
             };
             meta.name = rars::filename::encode_rar50(link).into_owned();
             state.create_rar50_redirection(&meta, &redirection).unwrap();
+            state.publish().unwrap();
             assert_eq!(
                 fs::read(dir.join(OsStr::from_bytes(link))).unwrap(),
                 b"payload"
@@ -861,6 +1233,13 @@ mod tests {
                 } else {
                     ("sub_file", "links_item")
                 };
+                if kind != FSREDIR_UNIX_SYMLINK {
+                    // Redirections must also be recorded under the same path rules.
+                    meta.name = b"chain".to_vec();
+                    redirection.target_name = br"links\item".to_vec();
+                    state.create_rar50_redirection(&meta, &redirection).unwrap();
+                }
+                state.publish().unwrap();
                 assert_eq!(fs::read(dir.join(destination)).unwrap(), b"literal");
                 assert_eq!(fs::read(dir.join("sub/file")).unwrap(), b"nested");
                 assert_eq!(
@@ -873,10 +1252,6 @@ mod tests {
                         Path::new(source)
                     );
                 } else {
-                    // Redirections must also be recorded under the same path rules.
-                    meta.name = b"chain".to_vec();
-                    redirection.target_name = br"links\item".to_vec();
-                    state.create_rar50_redirection(&meta, &redirection).unwrap();
                     assert_eq!(fs::read(dir.join("chain")).unwrap(), b"literal");
                 }
             }
@@ -917,6 +1292,7 @@ mod tests {
                     "multiple archive entries map to the same output path"
                 ))
             ));
+            state.publish().unwrap();
             assert_eq!(fs::read(dir.join(name)).unwrap(), b"keep me");
         }
     }
