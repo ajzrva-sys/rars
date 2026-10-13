@@ -12,7 +12,8 @@ pub enum Error {
     SingularElement,
     RebuildTooLarge,
     /// A repair solve, padded reconstruction or record rebuild exceeds its
-    /// fixed workspace admission ceiling. This is not a process-RAM quota.
+    /// workspace admission ceiling, which scales with the bytes supplied.
+    /// This is not a process-RAM quota.
     RepairWorkspaceLimitExceeded {
         limit: u64,
         required: u64,

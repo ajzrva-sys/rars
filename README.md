@@ -112,10 +112,13 @@ sequential execution; bare WebAssembly also runs sequentially. Writing and
 recovery enable entropy support, including encrypted header reconstruction during
 repair; encrypted reading alone does not need entropy.
 
-RAR5 recovery repair checks a fixed 256 MiB ceiling before allocating solve
+RAR5 recovery repair checks a workspace ceiling before allocating solve
 matrices, their working copies, RHS scratch and repaired or padded shard output.
-Incomplete-record rebuilding also checks its full encoder matrix, resident
-parity, framing scratch and intermediate record buffer against that ceiling.
+The ceiling is four times the archive and recovery bytes supplied, and never
+less than 256 MiB, so genuine archives of any size fit while a small record
+declaring huge geometry is refused. Incomplete-record rebuilding also checks
+its full encoder matrix, resident parity, framing scratch and intermediate
+record buffer against that ceiling.
 An oversized solve returns a `ResourceLimit` error; an oversized rebuild keeps
 the repaired prefix and existing incomplete record. Archive input, parsed record
 storage, shared field tables, final collected archive output and allocator or
