@@ -2476,26 +2476,29 @@ mod tests {
             ))
         ));
 
-        let archive = build_archive_with_optional_comment(None);
-        let mut file = archive.files().next().unwrap().clone();
-        file.encrypted = true;
-        file.encryption = Some(plain.clone());
-        attach_file_crypto(&mut file, Some(b"password")).unwrap();
-        assert!(file.crypto.is_some());
+        #[cfg(feature = "encryption")]
+        {
+            let archive = build_archive_with_optional_comment(None);
+            let mut file = archive.files().next().unwrap().clone();
+            file.encrypted = true;
+            file.encryption = Some(plain.clone());
+            attach_file_crypto(&mut file, Some(b"password")).unwrap();
+            assert!(file.crypto.is_some());
 
-        let mut unsupported = archive.files().next().unwrap().clone();
-        unsupported.encrypted = true;
-        unsupported.encryption = Some(FileEncryption {
-            version: 1,
-            ..plain
-        });
-        assert!(matches!(
-            attach_file_crypto(&mut unsupported, Some(b"password")),
-            Err(Error::UnsupportedFeature {
-                feature: "RAR 5 unknown file encryption version",
-                ..
-            })
-        ));
+            let mut unsupported = archive.files().next().unwrap().clone();
+            unsupported.encrypted = true;
+            unsupported.encryption = Some(FileEncryption {
+                version: 1,
+                ..plain
+            });
+            assert!(matches!(
+                attach_file_crypto(&mut unsupported, Some(b"password")),
+                Err(Error::UnsupportedFeature {
+                    feature: "RAR 5 unknown file encryption version",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -3039,19 +3042,40 @@ mod tests {
     #[cfg(feature = "recovery")]
     fn recovery_end_header_requires_keys_for_encrypted_archive() {
         let bytes = include_bytes!("../tests/fixtures/rar50/header_encrypted.rar");
-        assert!(matches!(
-            recovery_end_header(bytes, crate::ArchiveReadOptions::new()),
-            Err(Error::NeedPassword)
-        ));
-        assert!(matches!(
-            recovery_end_header(bytes, crate::ArchiveReadOptions::with_password(b"wrong")),
-            Err(Error::WrongPasswordOrCorruptData)
-        ));
-        assert!(
-            !recovery_end_header(bytes, crate::ArchiveReadOptions::with_password(b"password"))
-                .unwrap()
-                .is_empty()
-        );
+        #[cfg(feature = "encryption")]
+        {
+            assert!(matches!(
+                recovery_end_header(bytes, crate::ArchiveReadOptions::new()),
+                Err(Error::NeedPassword)
+            ));
+            assert!(matches!(
+                recovery_end_header(bytes, crate::ArchiveReadOptions::with_password(b"wrong")),
+                Err(Error::WrongPasswordOrCorruptData)
+            ));
+            assert!(!recovery_end_header(
+                bytes,
+                crate::ArchiveReadOptions::with_password(b"password")
+            )
+            .unwrap()
+            .is_empty());
+        }
+        #[cfg(not(feature = "encryption"))]
+        for options in [
+            crate::ArchiveReadOptions::new(),
+            crate::ArchiveReadOptions::with_password(b"wrong"),
+            crate::ArchiveReadOptions::with_password(b"password"),
+        ] {
+            let error = recovery_end_header(bytes, options).unwrap_err();
+            assert!(
+                matches!(
+                    error.root_cause(),
+                    Error::FeatureDisabled {
+                        feature: "encryption"
+                    }
+                ),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]
@@ -3127,36 +3151,39 @@ mod tests {
                 .rewrite_metadata_complete
         );
 
-        // A crypt header with a valid CRC can still truncate the KDF count,
-        // salt or password-check field. Test every field boundary explicitly.
-        for flags in [0, 1] {
-            let mut body = vec![HEAD_CRYPT as u8, 0, 0, flags, 0];
-            body.extend_from_slice(&[0; 16]);
-            if flags == 1 {
-                body.extend_from_slice(&[0; 12]);
-            }
-            for end in 4..body.len() {
-                let header = image(&body[..end]);
-                let parsed = parse(&header).unwrap();
-                assert!(
-                    matches!(
-                        parse_archive_encryption_header(&parsed, Some(b"pw")),
-                        Err(Error::TooShort)
-                    ),
-                    "flags {flags}, end {end}"
-                );
-            }
-            if flags == 0 {
-                let header = image(&body);
-                parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")).unwrap();
-                body.push(0);
-                let header = image(&body);
-                assert!(matches!(
-                    parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")),
-                    Err(Error::InvalidHeader(
-                        "RAR 5 archive encryption header has trailing bytes"
-                    ))
-                ));
+        #[cfg(feature = "encryption")]
+        {
+            // A crypt header with a valid CRC can still truncate the KDF count,
+            // salt or password-check field. Test every field boundary explicitly.
+            for flags in [0, 1] {
+                let mut body = vec![HEAD_CRYPT as u8, 0, 0, flags, 0];
+                body.extend_from_slice(&[0; 16]);
+                if flags == 1 {
+                    body.extend_from_slice(&[0; 12]);
+                }
+                for end in 4..body.len() {
+                    let header = image(&body[..end]);
+                    let parsed = parse(&header).unwrap();
+                    assert!(
+                        matches!(
+                            parse_archive_encryption_header(&parsed, Some(b"pw")),
+                            Err(Error::TooShort)
+                        ),
+                        "flags {flags}, end {end}"
+                    );
+                }
+                if flags == 0 {
+                    let header = image(&body);
+                    parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")).unwrap();
+                    body.push(0);
+                    let header = image(&body);
+                    assert!(matches!(
+                        parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")),
+                        Err(Error::InvalidHeader(
+                            "RAR 5 archive encryption header has trailing bytes"
+                        ))
+                    ));
+                }
             }
         }
         let mut bytes = RAR50_SIGNATURE.to_vec();
@@ -3185,8 +3212,9 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "encryption")]
         let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
-        for (declared, encrypted_expected) in [
+        for (declared, _encrypted_expected) in [
             (u64::MAX, "RAR 5 header size overflows usize"),
             (u64::MAX - 28, "RAR 5 encrypted header size overflows"),
             (u64::MAX - 34, "RAR 5 encrypted header size overflows"),
@@ -3219,38 +3247,41 @@ mod tests {
                 }
             }
 
-            let mut first_plain = prefix;
-            first_plain.resize(16, 0);
-            Rar50Cipher::new(keys.key, [0; 16])
-                .encrypt_in_place(&mut first_plain)
-                .unwrap();
-            let mut encrypted = vec![0; 16];
-            encrypted.extend_from_slice(&first_plain);
-            let memory = parse_encrypted_block_header_bytes(
-                &encrypted,
-                0,
-                encrypted.len(),
-                0,
-                &keys,
-                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
-            );
-            let seekable = read_encrypted_block_header_at(
-                &mut std::io::Cursor::new(&encrypted),
-                0,
-                encrypted.len(),
-                0,
-                &keys,
-                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
-            );
-            for result in [memory, seekable] {
-                let expected = if usize::BITS == 32 {
-                    "RAR 5 header size overflows usize"
-                } else {
-                    encrypted_expected
-                };
-                assert!(
-                    matches!(result, Err(Error::InvalidHeader(message)) if message == expected)
+            #[cfg(feature = "encryption")]
+            {
+                let mut first_plain = prefix;
+                first_plain.resize(16, 0);
+                Rar50Cipher::new(keys.key, [0; 16])
+                    .encrypt_in_place(&mut first_plain)
+                    .unwrap();
+                let mut encrypted = vec![0; 16];
+                encrypted.extend_from_slice(&first_plain);
+                let memory = parse_encrypted_block_header_bytes(
+                    &encrypted,
+                    0,
+                    encrypted.len(),
+                    0,
+                    &keys,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
                 );
+                let seekable = read_encrypted_block_header_at(
+                    &mut std::io::Cursor::new(&encrypted),
+                    0,
+                    encrypted.len(),
+                    0,
+                    &keys,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+                );
+                for result in [memory, seekable] {
+                    let expected = if usize::BITS == 32 {
+                        "RAR 5 header size overflows usize"
+                    } else {
+                        _encrypted_expected
+                    };
+                    assert!(
+                        matches!(result, Err(Error::InvalidHeader(message)) if message == expected)
+                    );
+                }
             }
         }
     }
@@ -3280,38 +3311,40 @@ mod tests {
                 Err(Error::InvalidHeader("RAR 5 vint is too long"))
             ));
         }
-        let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
-        let mut first_plain = overlong;
-        first_plain.resize(16, 0);
-        Rar50Cipher::new(keys.key, [0; 16])
-            .encrypt_in_place(&mut first_plain)
-            .unwrap();
-        let mut encrypted = vec![0; 16];
-        encrypted.extend_from_slice(&first_plain);
-        for result in [
-            parse_encrypted_block_header_bytes(
-                &encrypted,
-                0,
-                encrypted.len(),
-                0,
-                &keys,
-                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
-            ),
-            read_encrypted_block_header_at(
-                &mut std::io::Cursor::new(&encrypted),
-                0,
-                encrypted.len(),
-                0,
-                &keys,
-                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
-            ),
-        ] {
-            assert!(matches!(
-                result,
-                Err(Error::InvalidHeader("RAR 5 vint is too long"))
-            ));
+        #[cfg(feature = "encryption")]
+        {
+            let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
+            let mut first_plain = overlong;
+            first_plain.resize(16, 0);
+            Rar50Cipher::new(keys.key, [0; 16])
+                .encrypt_in_place(&mut first_plain)
+                .unwrap();
+            let mut encrypted = vec![0; 16];
+            encrypted.extend_from_slice(&first_plain);
+            for result in [
+                parse_encrypted_block_header_bytes(
+                    &encrypted,
+                    0,
+                    encrypted.len(),
+                    0,
+                    &keys,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+                ),
+                read_encrypted_block_header_at(
+                    &mut std::io::Cursor::new(&encrypted),
+                    0,
+                    encrypted.len(),
+                    0,
+                    &keys,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+                ),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(Error::InvalidHeader("RAR 5 vint is too long"))
+                ));
+            }
         }
-
         let maximum_vint = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1];
         for (flag, expected) in [
             (HFL_EXTRA, "RAR 5 extra area size overflows usize"),
@@ -3538,7 +3571,15 @@ mod tests {
                     crate::ArchiveReadOptions::new(),
                 ),
             ] {
-                assert!(matches!(result.unwrap_err().root_cause(), Error::TooShort));
+                let error = result.unwrap_err();
+                let expected = if body[0] == HEAD_CRYPT as u8 && !cfg!(feature = "encryption") {
+                    Error::FeatureDisabled {
+                        feature: "encryption",
+                    }
+                } else {
+                    Error::TooShort
+                };
+                assert_eq!(error.root_cause(), &expected);
             }
         }
         let mut bytes = RAR50_SIGNATURE.to_vec();
@@ -3633,61 +3674,65 @@ mod tests {
             assert!(cancelled.is_cancelled());
         }
 
-        let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
-        let mut encoded = vec![3, HEAD_MAIN as u8, 0, 0];
-        let mut first_plain = crc32(&encoded).to_le_bytes().to_vec();
-        first_plain.append(&mut encoded);
-        first_plain.resize(16, 0);
-        Rar50Cipher::new(keys.key, [0; 16])
-            .encrypt_in_place(&mut first_plain)
-            .unwrap();
-        let mut encrypted = vec![0; 16];
-        encrypted.extend_from_slice(&first_plain);
-        let parse_encrypted = |stop_at, cancellation: Option<&crate::ReadCancellation>| {
-            operations.store(0, Ordering::Relaxed);
-            read_encrypted_block_header_at(
-                &mut FaultReader {
-                    input: Cursor::new(encrypted.clone()),
-                    operations: operations.clone(),
-                    stop_at,
-                    cancellation: cancellation.cloned(),
-                },
-                0,
-                encrypted.len(),
-                0,
-                &keys,
-                &mut crate::parse_budget::ParseBudget::new(
-                    cancellation.map_or_else(crate::ArchiveReadOptions::new, |token| {
-                        crate::ArchiveReadOptions::new().with_cancellation(token)
-                    }),
-                ),
-            )
-        };
-        assert_eq!(
-            parse_encrypted(usize::MAX, None).unwrap().block.header_type,
-            HEAD_MAIN
-        );
-        let count = operations.load(Ordering::Relaxed);
-        assert!(count > 1);
-        for operation in 0..count {
-            let error = parse_encrypted(operation, None)
-                .err()
-                .expect("input fault refused");
-            assert!(matches!(error.root_cause(), Error::Io(source)
-                if source.kind == std::io::ErrorKind::PermissionDenied && source.message == "RAR5 input fault"));
-            assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
-            let cancelled = crate::ReadCancellation::new();
-            let error = parse_encrypted(operation, Some(&cancelled))
-                .err()
-                .expect("cancellation observed");
-            assert!(
-                matches!(error.root_cause(), Error::Cancelled),
-                "encrypted operation {operation}: {error:?}"
+        #[cfg(feature = "encryption")]
+        {
+            let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
+            let mut encoded = vec![3, HEAD_MAIN as u8, 0, 0];
+            let mut first_plain = crc32(&encoded).to_le_bytes().to_vec();
+            first_plain.append(&mut encoded);
+            first_plain.resize(16, 0);
+            Rar50Cipher::new(keys.key, [0; 16])
+                .encrypt_in_place(&mut first_plain)
+                .unwrap();
+            let mut encrypted = vec![0; 16];
+            encrypted.extend_from_slice(&first_plain);
+            let parse_encrypted = |stop_at, cancellation: Option<&crate::ReadCancellation>| {
+                operations.store(0, Ordering::Relaxed);
+                read_encrypted_block_header_at(
+                    &mut FaultReader {
+                        input: Cursor::new(encrypted.clone()),
+                        operations: operations.clone(),
+                        stop_at,
+                        cancellation: cancellation.cloned(),
+                    },
+                    0,
+                    encrypted.len(),
+                    0,
+                    &keys,
+                    &mut crate::parse_budget::ParseBudget::new(
+                        cancellation.map_or_else(crate::ArchiveReadOptions::new, |token| {
+                            crate::ArchiveReadOptions::new().with_cancellation(token)
+                        }),
+                    ),
+                )
+            };
+            assert_eq!(
+                parse_encrypted(usize::MAX, None).unwrap().block.header_type,
+                HEAD_MAIN
             );
+            let count = operations.load(Ordering::Relaxed);
+            assert!(count > 1);
+            for operation in 0..count {
+                let error = parse_encrypted(operation, None)
+                    .err()
+                    .expect("input fault refused");
+                assert!(matches!(error.root_cause(), Error::Io(source)
+                if source.kind == std::io::ErrorKind::PermissionDenied && source.message == "RAR5 input fault"));
+                assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+                let cancelled = crate::ReadCancellation::new();
+                let error = parse_encrypted(operation, Some(&cancelled))
+                    .err()
+                    .expect("cancellation observed");
+                assert!(
+                    matches!(error.root_cause(), Error::Cancelled),
+                    "encrypted operation {operation}: {error:?}"
+                );
+            }
         }
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_key_failures_retain_specific_diagnostics() {
         let mut encoded = vec![HEAD_CRYPT as u8, 0, 0, 0, 25];
         encoded.extend_from_slice(&[0; 16]);
@@ -3754,6 +3799,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn unknown_archive_encryption_flags_disable_rewrite_preservation() {
         let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
             .store(true)
@@ -4114,6 +4160,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_header_extent_rejects_short_prefix_and_declared_ciphertext() {
         use crate::parse_budget::ParseBudget;
         let keys = crate::crypto::rar50::Rar50Keys::derive(b"secret", [0; 16], 0).unwrap();
@@ -4167,28 +4214,31 @@ mod tests {
         ));
         assert_eq!(reader.reads, [14]);
 
-        let keys = crate::crypto::rar50::Rar50Keys::derive(b"secret", [0; 16], 0).unwrap();
-        crate::crypto::rar50::Rar50Cipher::new(keys.key, [0; 16])
-            .encrypt_in_place(&mut plain)
-            .unwrap();
-        let mut prefix = vec![0; 16];
-        prefix.extend_from_slice(&plain);
-        let mut reader = PrefixReader::new(prefix);
-        let e = super::read_encrypted_block_header_at(
-            &mut reader,
-            0,
-            128,
-            0,
-            &keys,
-            &mut ParseBudget::new(options),
-        )
-        .map(|_| ())
-        .expect_err("header budget must refuse");
-        assert!(matches!(
-            e.root_cause(),
-            crate::Error::HeaderBytesLimitExceeded { required: 65, .. }
-        ));
-        assert_eq!(reader.reads, [32]);
+        #[cfg(feature = "encryption")]
+        {
+            let keys = crate::crypto::rar50::Rar50Keys::derive(b"secret", [0; 16], 0).unwrap();
+            crate::crypto::rar50::Rar50Cipher::new(keys.key, [0; 16])
+                .encrypt_in_place(&mut plain)
+                .unwrap();
+            let mut prefix = vec![0; 16];
+            prefix.extend_from_slice(&plain);
+            let mut reader = PrefixReader::new(prefix);
+            let e = super::read_encrypted_block_header_at(
+                &mut reader,
+                0,
+                128,
+                0,
+                &keys,
+                &mut ParseBudget::new(options),
+            )
+            .map(|_| ())
+            .expect_err("header budget must refuse");
+            assert!(matches!(
+                e.root_cause(),
+                crate::Error::HeaderBytesLimitExceeded { required: 65, .. }
+            ));
+            assert_eq!(reader.reads, [32]);
+        }
     }
     use super::*;
 
@@ -4411,16 +4461,44 @@ mod tests {
             let offset = bytes.len();
             bytes.extend_from_slice(&header);
             let options = crate::ArchiveReadOptions::with_password(b"secret");
-            let memory = Archive::parse_with_options(&bytes, options).unwrap_err();
+            let memory = Archive::parse_with_options(&bytes, options);
             let seekable = Archive::parse_file_backed(
                 &mut std::io::Cursor::new(&bytes),
                 bytes.len(),
                 0,
                 ArchiveSource::Memory(std::sync::Arc::from(bytes.clone())),
                 options,
-            )
-            .unwrap_err();
+            );
+            if expected_kind == crate::ErrorKind::UnsupportedFeature
+                && !cfg!(feature = "encryption")
+            {
+                // Without crypto, an unknown encryption version remains readable metadata.
+                for archive in [memory, seekable] {
+                    let archive = archive.unwrap();
+                    let file = match archive.blocks.last().unwrap() {
+                        Block::File(file) | Block::Service(file) => file,
+                        _ => panic!("expected encryption metadata"),
+                    };
+                    assert_eq!(file.encryption.as_ref().unwrap().version, 1);
+                    assert!(file.crypto.is_none());
+                    assert!(!file.rewrite_metadata_complete);
+                    for password in [None, Some(b"secret".as_slice())] {
+                        let mut output = b"untouched".to_vec();
+                        assert_eq!(
+                            file.write_to(&archive, password, &mut output)
+                                .unwrap_err()
+                                .root_cause(),
+                            &Error::FeatureDisabled {
+                                feature: "encryption"
+                            }
+                        );
+                        assert_eq!(output, b"untouched");
+                    }
+                }
+                continue;
+            }
             for error in [memory, seekable] {
+                let error = error.unwrap_err();
                 assert_eq!(error.kind(), expected_kind, "{error}");
                 assert!(
                     matches!(error, Error::AtArchiveOffset { offset: actual, .. } if actual == offset),

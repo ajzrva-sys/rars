@@ -257,4 +257,120 @@ mod tests {
         );
         assert_eq!(empty, Ok(()));
     }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn threaded_windows_preserve_order_and_wait_for_admitted_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let input = [3, 1, 2, 4];
+        let active = AtomicUsize::new(0);
+        struct Active<'a>(&'a AtomicUsize);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        for window in [0, 1, 2, 8] {
+            let mut emitted = Vec::new();
+            let result: Result<(), ()> = super::threaded::map_slice_windowed(
+                &input,
+                window,
+                |x| {
+                    active.fetch_add(1, Ordering::Relaxed);
+                    let _active = Active(&active);
+                    Ok(x * 2)
+                },
+                |x, y| {
+                    emitted.push((*x, y));
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(emitted, [(3, 6), (1, 2), (2, 4), (4, 8)]);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+        let mut emitted = Vec::new();
+        let result = super::threaded::map_slice_windowed(
+            &input,
+            2,
+            |x| {
+                active.fetch_add(1, Ordering::Relaxed);
+                let _active = Active(&active);
+                if *x == 2 {
+                    Err(11)
+                } else {
+                    Ok(x * 2)
+                }
+            },
+            |x, y| {
+                emitted.push((*x, y));
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(11));
+        // A mapping failure discards the whole failed window. Earlier windows
+        // are already published, and every admitted mapping has returned.
+        assert_eq!(emitted, [(3, 6), (1, 2)]);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+
+        let visited = Mutex::new(Vec::new());
+        emitted.clear();
+        let result = super::threaded::map_slice_windowed(
+            &input,
+            2,
+            |x| {
+                visited.lock().unwrap().push(*x);
+                Ok(x * 2)
+            },
+            |x, y| {
+                emitted.push((*x, y));
+                if *x == 1 {
+                    Err(12)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Err(12));
+        assert_eq!(emitted, [(3, 6), (1, 2)]);
+        let mut visited = visited.into_inner().unwrap();
+        visited.sort_unstable();
+        assert_eq!(
+            visited,
+            [1, 3],
+            "later windows must not start after consumer failure"
+        );
+
+        emitted.clear();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), ()> = super::threaded::map_slice_windowed(
+                &input,
+                2,
+                |x| {
+                    active.fetch_add(1, Ordering::Relaxed);
+                    let _active = Active(&active);
+                    assert_ne!(*x, 2, "injected map panic");
+                    Ok(x * 2)
+                },
+                |x, y| {
+                    emitted.push((*x, y));
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(emitted, [(3, 6), (1, 2)]);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let empty: Result<(), ()> = super::threaded::map_slice_windowed::<usize, usize, _, _, _>(
+            &[],
+            0,
+            |_| panic!("empty map"),
+            |_, _| panic!("empty consume"),
+        );
+        assert_eq!(empty, Ok(()));
+    }
 }

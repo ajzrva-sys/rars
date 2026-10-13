@@ -137,3 +137,41 @@ jobs:
           cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target '${{ matrix.target }}' --features encryption
       - name: Check full library
         run: cargo check -p rars --lib --locked --target '${{ matrix.target }}'
+
+  unit-features:
+    name: Library unit features (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        features:
+          - none
+          - parallel
+          - encryption
+          - encryption,parallel
+          - recovery
+          - recovery,parallel
+          - recovery,encryption
+          - recovery,encryption,parallel
+          - write
+          - write,parallel
+          - write,encryption
+          - write,encryption,parallel
+          - write,recovery
+          - write,recovery,parallel
+          - write,recovery,encryption
+          - write,recovery,encryption,parallel
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      RUST_TEST_THREADS: 2
+      RAYON_NUM_THREADS: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the library without workspace feature unification
+        run: python3 scripts/check-unit-features.py --features '${{ matrix.features }}'

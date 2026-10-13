@@ -2017,6 +2017,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn rar13_entry_encryption_override_can_clear_the_builder_password() {
         use crate::{ArchiveReader, ArchiveVersion, Builder};
 
@@ -2179,6 +2180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn legacy_comments_coexist_with_salt_and_extended_times() {
         let mut builder = Builder::new(ArchiveVersion::Rar29)
             .password(Some(b"secret".to_vec()))
@@ -2218,6 +2220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn legacy_header_encryption_survives_removing_encrypted_member() {
         let mut builder = Builder::new(ArchiveVersion::Rar30)
             .password(Some(b"secret".to_vec()))
@@ -2343,13 +2346,13 @@ mod tests {
     #[test]
     fn empty_rewrites_retain_archive_settings() {
         for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
-            for encrypted in [false, true] {
+            for encrypted in crate::test_features::encryption_cases() {
                 let password = encrypted.then_some(b"secret".as_slice());
                 let builder = Builder::new(format)
                     .solid(true)
                     .password(password.map(<[u8]>::to_vec))
                     .header_encryption(encrypted)
-                    .recovery_percent(Some(5))
+                    .recovery_percent(cfg!(feature = "recovery").then_some(5))
                     .comment(Some(b"comment".to_vec()));
                 let options = crate::ArchiveReadOptions {
                     password,
@@ -2371,7 +2374,7 @@ mod tests {
                     crate::ArchiveReader::read_owned_with_options(rewritten, options).unwrap();
                 let raw = output.as_rar50().unwrap();
                 assert!(raw.main.is_solid());
-                assert!(raw.main.has_recovery_record());
+                assert_eq!(raw.main.has_recovery_record(), cfg!(feature = "recovery"));
                 assert_eq!(raw.main.encrypted_headers, encrypted);
                 assert_eq!(raw.files().count(), 0);
                 assert!(output.rewrite_preservation_issues().is_empty());
@@ -2380,6 +2383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn header_encryption_does_not_require_encrypted_members() {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
             .password(Some(b"secret".to_vec()))

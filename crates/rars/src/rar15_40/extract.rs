@@ -836,23 +836,28 @@ mod tests {
                 20 => crate::codec::rar20::unpack20_encode_literals(plain).unwrap(),
                 _ => crate::codec::rar29::unpack29_encode_literals(plain).unwrap(),
             };
-            for encrypted in [false, true] {
-                let mut payload = packed.clone();
+            for encrypted in crate::test_features::encryption_cases() {
+                let payload = packed.clone();
+                #[cfg(feature = "encryption")]
+                let mut payload = payload;
                 if encrypted {
-                    match version {
-                        15 => Rar15Cipher::new(b"pw").crypt_in_place(&mut payload),
-                        20 => {
-                            payload.resize(payload.len().div_ceil(16) * 16, 0);
-                            Rar20Cipher::new(b"pw")
-                                .encrypt_in_place(&mut payload)
-                                .unwrap();
-                        }
-                        _ => {
-                            payload.resize(payload.len().div_ceil(16) * 16, 0);
-                            Rar30Cipher::new(b"pw", None)
-                                .unwrap()
-                                .encrypt_in_place(&mut payload)
-                                .unwrap();
+                    #[cfg(feature = "encryption")]
+                    {
+                        match version {
+                            15 => Rar15Cipher::new(b"pw").crypt_in_place(&mut payload),
+                            20 => {
+                                payload.resize(payload.len().div_ceil(16) * 16, 0);
+                                Rar20Cipher::new(b"pw")
+                                    .encrypt_in_place(&mut payload)
+                                    .unwrap();
+                            }
+                            _ => {
+                                payload.resize(payload.len().div_ceil(16) * 16, 0);
+                                Rar30Cipher::new(b"pw", None)
+                                    .unwrap()
+                                    .encrypt_in_place(&mut payload)
+                                    .unwrap();
+                            }
                         }
                     }
                 }
@@ -891,6 +896,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn reader_session_workspace_refusal_keeps_its_resource_kind_for_encrypted_members() {
         let mut entry = file(b"quota.bin", FHD_PASSWORD);
         entry.method = 0x33;
@@ -918,6 +924,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn reader_workspace_refusals_release_legacy_cipher_and_decryption_buffers() {
         use crate::codec::workspace::RefusingBudget;
         for version in [15, 20, 29] {
@@ -963,6 +970,7 @@ mod tests {
         FHD_SPLIT_AFTER, FHD_SPLIT_BEFORE,
     };
     use super::*;
+    #[cfg(feature = "encryption")]
     use std::io::Cursor;
     use std::sync::Arc;
 
@@ -997,17 +1005,20 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "encryption")]
     struct ChunkedReader<R> {
         inner: R,
         chunk: usize,
     }
 
+    #[cfg(feature = "encryption")]
     impl<R: Read> ChunkedReader<R> {
         fn new(inner: R, chunk: usize) -> Self {
             Self { inner, chunk }
         }
     }
 
+    #[cfg(feature = "encryption")]
     impl<R: Read> Read for ChunkedReader<R> {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             let take = out.len().min(self.chunk);
@@ -1029,6 +1040,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_streams_rar15_payload() {
         let plain = b"RAR 1.5 encrypted payload read in pieces";
         let mut encrypted = plain.to_vec();
@@ -1049,6 +1061,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_streams_rar20_blocks_from_short_inner_reads() {
         let plain = *b"0123456789abcdefRAR2 block two!!";
         let mut encrypted = plain;
@@ -1068,6 +1081,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_streams_rar30_blocks_from_short_inner_reads() {
         let salt = Some([7u8; 8]);
         let plain = *b"0123456789abcdefRAR3 block two!!";
@@ -1089,6 +1103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_preserves_partial_blocks_across_source_errors() {
         let plain = *b"0123456789abcdefRAR3 block two!!";
         let salt = Some([7; 8]);
@@ -1135,6 +1150,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_preserves_complete_blocks_and_caches_eof() {
         struct CountingReader {
             inner: Cursor<Vec<u8>>,
@@ -1215,11 +1231,23 @@ mod tests {
         ));
 
         let encrypted = file(b"a", FHD_PASSWORD | FHD_SPLIT_AFTER);
-        assert!(matches!(
-            validate_split_fragment(&encrypted, None),
-            Err(Error::NeedPassword)
-        ));
-        validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
+        #[cfg(feature = "encryption")]
+        {
+            assert!(matches!(
+                validate_split_fragment(&encrypted, None),
+                Err(Error::NeedPassword)
+            ));
+            validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
+        }
+        #[cfg(not(feature = "encryption"))]
+        for password in [None, Some(b"pw".as_slice())] {
+            assert!(matches!(
+                validate_split_fragment(&encrypted, password),
+                Err(Error::FeatureDisabled {
+                    feature: "encryption"
+                })
+            ));
+        }
 
         let plain = file(b"a", FHD_SPLIT_AFTER);
         validate_split_fragment(&plain, None).unwrap();
@@ -1251,9 +1279,17 @@ mod tests {
         ));
 
         let new_encryption = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_BEFORE);
+        #[cfg(feature = "encryption")]
         assert!(matches!(
             validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
             Err(Error::InvalidHeader(_))
+        ));
+        #[cfg(not(feature = "encryption"))]
+        assert!(matches!(
+            validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
+            Err(Error::FeatureDisabled {
+                feature: "encryption"
+            })
         ));
 
         let same = file(b"a.txt", FHD_SPLIT_BEFORE);
@@ -1261,6 +1297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn validate_split_continuation_refs_rejects_salt_drift_for_rar3_encrypted_entries() {
         let mut first = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_AFTER);
         first.salt = Some([1u8; 8]);
@@ -1317,6 +1354,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_split_fragment_reader_decrypts_after_chaining_fragments() {
         let plain = *b"0123456789abcdefRAR2 block two!!";
         let mut encrypted = plain;
@@ -1531,6 +1569,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn split_cipher_new_rejects_unsupported_unpack_version() {
         for ver in [14u8, 16, 19, 25, 27, 28] {
             assert!(
@@ -1544,6 +1583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_rejects_non_utf8_rar30_password() {
         let result = DecryptingReader::new(Cursor::new(Vec::<u8>::new()), 29, &[0xff], None);
         assert!(matches!(
@@ -1553,6 +1593,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_new_rejects_unsupported_unpack_version() {
         let result = DecryptingReader::new(Cursor::new(Vec::<u8>::new()), 25, b"pw", None);
         assert!(matches!(
@@ -1565,6 +1606,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_rejects_non_block_aligned_rar20_payload() {
         let mut payload = vec![0u8; 23];
         Rar20Cipher::new(b"pw")
@@ -1583,6 +1625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_reports_rar30_body_crypto_errors_without_header_context() {
         let error = super::map_rar30_crypto_error(Rar30Error::UnalignedInput);
         assert!(matches!(
@@ -1998,6 +2041,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_works_through_boxed_inner_reader() {
         let plain = *b"0123456789abcdefRAR2 block two!!";
         let mut encrypted = plain;
@@ -2012,6 +2056,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_boxed_inner_rejects_non_block_aligned_eof() {
         let mut payload = vec![0u8; 32];
         Rar20Cipher::new(b"pw")
@@ -2067,6 +2112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn split_rar15_encrypted_stored_member_has_no_block_padding() {
         let payload = b"legacy byte cipher split";
         let mut encrypted = payload.to_vec();
@@ -2097,6 +2143,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn extract_volumes_to_assembles_encrypted_stored_split_across_two_volumes() {
         let payload: &[u8] = b"twenty-byte payload!"; // exactly 20 bytes
         let unpacked_len = payload.len();
@@ -2141,6 +2188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_stored_split_rejects_unpacked_size_rounding_overflow() {
         let mut first = file(b"overflow", FHD_PASSWORD | FHD_SPLIT_AFTER);
         first.unp_ver = 20;
@@ -2172,6 +2220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn extract_volumes_to_rejects_encrypted_stored_split_when_padded_size_disagrees() {
         let unpacked_len = 20usize;
         // Two volumes total only 30 bytes, but expected_packed_len == 32.

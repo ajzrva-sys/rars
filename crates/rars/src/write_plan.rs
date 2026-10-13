@@ -369,11 +369,19 @@ mod tests {
     fn every_option_is_supported_by_some_format() {
         for option in WriterOption::ALL {
             assert!(!option.name().is_empty());
-            assert!(
+            let disabled = match option {
+                WriterOption::Password | WriterOption::Feature(Feature::HeaderEncryption) => {
+                    !cfg!(feature = "encryption")
+                }
+                WriterOption::RecoveryRecord => !cfg!(feature = "recovery"),
+                _ => false,
+            };
+            assert_eq!(
                 PlanShape::all()
                     .into_iter()
                     .any(|shape| !formats_supporting(option, shape).is_empty()),
-                "{option:?} is supported by nothing, so a refusal could not point anywhere"
+                !disabled,
+                "{option:?} must have a supporting format exactly when its capability is enabled"
             );
         }
     }

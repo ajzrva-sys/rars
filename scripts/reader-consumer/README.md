@@ -72,3 +72,9 @@ Repeat with `--features full` and a different empty target directory. Record the
 compiler version and use identical consumer code and release profiles. The
 release profile strips symbols. Compile times depend on the machine and cache;
 executable size excludes unused library code removed by the linker.
+
+The library's own unit harness supports the same 16 independent feature subsets.
+Run `python3 scripts/check-unit-features.py` for the complete unit matrix, or add
+`--features write` (or another comma-separated subset) for one configuration.
+These runs deny compiler warnings and select only the library harness; default
+workspace integration tests and the independent consumer checks remain separate.

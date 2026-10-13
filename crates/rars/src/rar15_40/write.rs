@@ -3008,6 +3008,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_payload_padding_preserves_cipher_state_across_chunks() {
         for target in [crate::ArchiveVersion::Rar20, crate::ArchiveVersion::Rar30] {
             for length in [0usize, 1, 15, 16, 17, 65535, 65536, 65537] {

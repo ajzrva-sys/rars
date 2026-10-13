@@ -32,3 +32,33 @@ impl<R, B> std::io::Read for Reader<R, B> {
         match self.unavailable {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn constructors_refuse_before_input_or_workspace_access() {
+        struct Unread;
+        impl std::io::Read for Unread {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("disabled crypto must not read input")
+            }
+        }
+        let allowance = crate::codec::workspace::Allowance::limited(0);
+        let result = Reader::with_allowance(Unread, 29, b"password", None, &allowance);
+        assert!(matches!(
+            result,
+            Err(Error::FeatureDisabled {
+                feature: "encryption"
+            })
+        ));
+        assert_eq!(allowance.used(), 0);
+        let result = Reader::with_keys(Unread, [0; 32], [0; 16]);
+        assert!(matches!(
+            result,
+            Err(Error::FeatureDisabled {
+                feature: "encryption"
+            })
+        ));
+    }
+}

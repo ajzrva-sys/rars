@@ -2806,27 +2806,31 @@ mod tests {
         ));
         assert_eq!(reader.reads, [7]);
 
-        let mut cipher = crate::crypto::rar30::Rar30Cipher::new(b"secret", Some([0; 8])).unwrap();
-        cipher.encrypt_in_place(&mut plain).unwrap();
-        let mut prefix = vec![0; 8];
-        prefix.extend_from_slice(&plain);
-        let mut reader = PrefixReader::new(prefix);
-        let e = super::read_encrypted_header_at(
-            &mut reader,
-            128,
-            0,
-            0,
-            b"secret",
-            &mut super::EncryptedHeaderCipherCache::default(),
-            &mut ParseBudget::new(options),
-        )
-        .map(|_| ())
-        .expect_err("header budget must refuse");
-        assert!(matches!(
-            e.root_cause(),
-            crate::Error::HeaderBytesLimitExceeded { required: 64, .. }
-        ));
-        assert_eq!(reader.reads, [24]);
+        #[cfg(feature = "encryption")]
+        {
+            let mut cipher =
+                crate::crypto::rar30::Rar30Cipher::new(b"secret", Some([0; 8])).unwrap();
+            cipher.encrypt_in_place(&mut plain).unwrap();
+            let mut prefix = vec![0; 8];
+            prefix.extend_from_slice(&plain);
+            let mut reader = PrefixReader::new(prefix);
+            let e = super::read_encrypted_header_at(
+                &mut reader,
+                128,
+                0,
+                0,
+                b"secret",
+                &mut super::EncryptedHeaderCipherCache::default(),
+                &mut ParseBudget::new(options),
+            )
+            .map(|_| ())
+            .expect_err("header budget must refuse");
+            assert!(matches!(
+                e.root_cause(),
+                crate::Error::HeaderBytesLimitExceeded { required: 64, .. }
+            ));
+            assert_eq!(reader.reads, [24]);
+        }
     }
     use super::*;
     use crate::io_util::read_u16;
@@ -2893,7 +2897,7 @@ mod tests {
     #[test]
     fn large_file_totals_refuse_relative_and_encrypted_prefix_overflow() {
         for head_type in [FILE_HEAD, NEWSUB_HEAD] {
-            for encrypted in [false, true] {
+            for encrypted in crate::test_features::encryption_cases() {
                 let pack_size = u64::MAX - 41;
                 let mut header = vec![0; 41];
                 header[2] = head_type;
@@ -2909,12 +2913,15 @@ mod tests {
                 let mut bytes = RAR15_SIGNATURE.to_vec();
                 test_write_main_header(&mut bytes, if encrypted { MHD_PASSWORD } else { 0 });
                 if encrypted {
-                    header.resize(48, 0);
-                    crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
-                        .unwrap()
-                        .encrypt_in_place(&mut header)
-                        .unwrap();
-                    bytes.extend_from_slice(&[0; 8]);
+                    #[cfg(feature = "encryption")]
+                    {
+                        header.resize(48, 0);
+                        crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
+                            .unwrap()
+                            .encrypt_in_place(&mut header)
+                            .unwrap();
+                        bytes.extend_from_slice(&[0; 8]);
+                    }
                 }
                 bytes.extend_from_slice(&header);
                 let options = crate::ArchiveReadOptions::with_password(b"pw");
@@ -3004,7 +3011,7 @@ mod tests {
 
     #[test]
     fn complete_header_crc_failures_survive_plain_and_encrypted_adapters() {
-        for encrypted in [false, true] {
+        for encrypted in crate::test_features::encryption_cases() {
             for corrupt in [false, true] {
                 let mut bytes = RAR15_SIGNATURE.to_vec();
                 test_write_main_header(&mut bytes, if encrypted { MHD_PASSWORD } else { 0 });
@@ -3016,12 +3023,15 @@ mod tests {
                     header[0] ^= 1;
                 }
                 if encrypted {
-                    header.resize(16, 0);
-                    crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
-                        .unwrap()
-                        .encrypt_in_place(&mut header)
-                        .unwrap();
-                    bytes.extend_from_slice(&[0; 8]);
+                    #[cfg(feature = "encryption")]
+                    {
+                        header.resize(16, 0);
+                        crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
+                            .unwrap()
+                            .encrypt_in_place(&mut header)
+                            .unwrap();
+                        bytes.extend_from_slice(&[0; 8]);
+                    }
                 }
                 bytes.extend_from_slice(&header);
                 let options = crate::ArchiveReadOptions::with_password(b"pw");
@@ -3339,7 +3349,7 @@ mod tests {
 
     #[test]
     fn sfx_payload_ranges_agree_for_plain_and_encrypted_headers() {
-        for encrypted in [false, true] {
+        for encrypted in crate::test_features::encryption_cases() {
             let mut builder = crate::Builder::new(if encrypted {
                 ArchiveVersion::Rar30
             } else {
@@ -3672,7 +3682,9 @@ mod tests {
             (ArchiveVersion::Rar15, false),
             (ArchiveVersion::Rar20, false),
             (ArchiveVersion::Rar29, false),
+            #[cfg(feature = "encryption")]
             (ArchiveVersion::Rar30, true),
+            #[cfg(feature = "encryption")]
             (ArchiveVersion::Rar40, true),
         ] {
             let mut builder = crate::Builder::new(target)
@@ -4495,6 +4507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn preservation_accepts_encrypted_cmt_with_its_declared_salt() {
         let mut builder = crate::Builder::new(ArchiveVersion::Rar30)
             .store(true)
@@ -4773,6 +4786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
         let mut cache = EncryptedHeaderCipherCache::default();
         for size in [0u16, 6, 17, 65] {
@@ -4998,6 +5012,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn archive_parse_owned_with_password_unlocks_encrypted_archive() {
         let features = FeatureSet::store_only();
         let bytes = write_stored_archive(
@@ -5074,6 +5089,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_stored_workspace_refusal_keeps_resource_error() {
         let bytes = write_stored_archive(
             &[StoredEntry {

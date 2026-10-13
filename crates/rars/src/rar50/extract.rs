@@ -152,7 +152,7 @@ impl FileHeader {
         Ok((PackedReader::Encrypted(reader), Some(keys)))
     }
 
-    #[cfg(all(test, feature = "write"))]
+    #[cfg(all(test, feature = "write", feature = "encryption"))]
     fn packed_reader_with_password<'a>(
         &self,
         archive: &'a Archive,
@@ -832,7 +832,7 @@ impl Archive {
             let selected_writer = match selected {
                 Some(crate::ExtractionDecision::Skip) => continue,
                 Some(crate::ExtractionDecision::Stop) => {
-                    return Ok(crate::ExtractionOutcome::Stopped)
+                    return Ok(crate::ExtractionOutcome::Stopped);
                 }
                 Some(crate::ExtractionDecision::Extract(writer)) => Some(writer),
                 None => None,
@@ -2063,6 +2063,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_split_reader_releases_descriptor_and_cipher_allocations() {
         let volumes = [
             include_bytes!("../../tests/fixtures/rar50/encrypted_multivol.part1.rar").as_slice(),
@@ -2149,7 +2150,7 @@ mod tests {
     #[test]
     fn reader_session_workspace_refusals_release_rar5_packed_output_cipher_and_checkpoints() {
         let data = b"RAR5 charged member payload!\n".repeat(3);
-        for encrypted in [false, true] {
+        for encrypted in crate::test_features::encryption_cases() {
             for filtered in [false, true] {
                 let input = if encrypted {
                     entry(b"charged.bin", &data).with_password(b"password".to_vec())
@@ -2199,6 +2200,7 @@ mod tests {
     use super::*;
     use crate::{ArchiveVersion, FeatureSet};
     use std::cell::RefCell;
+    #[cfg(feature = "encryption")]
     use std::io::Cursor;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -2528,6 +2530,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_streams_rar50_blocks() {
         let key = [3u8; 32];
         let iv = [4u8; 16];
@@ -2552,6 +2555,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_preserves_partial_blocks_across_source_errors() {
         let key = [3; 32];
         let iv = [4; 16];
@@ -2585,6 +2589,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_handles_short_reads_and_truncated_final_blocks() {
         let key = [3u8; 32];
         let iv = [4u8; 16];
@@ -3132,6 +3137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_keys_reject_missing_password_record_and_unsupported_versions() {
         let mut missing = plain_file(b"a.txt", b"", None);
         missing.encrypted = true;
@@ -3161,6 +3167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_keys_handles_missing_check_value() {
         let mut file = plain_file(b"a.txt", b"", None);
         file.encrypted = true;
@@ -3340,6 +3347,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn map_rar50_crypto_error_translates_kdf_count() {
         assert!(matches!(
             super::super::map_rar50_crypto_error(crate::crypto::rar50::Error::KdfCountTooLarge),
@@ -3523,11 +3531,23 @@ mod tests {
 
         let mut encrypted = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
         encrypted.encrypted = true;
-        assert!(matches!(
-            validate_split_fragment(&encrypted, None),
-            Err(Error::NeedPassword)
-        ));
-        validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
+        #[cfg(feature = "encryption")]
+        {
+            assert!(matches!(
+                validate_split_fragment(&encrypted, None),
+                Err(Error::NeedPassword)
+            ));
+            validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
+        }
+        #[cfg(not(feature = "encryption"))]
+        for password in [None, Some(b"pw".as_slice())] {
+            assert!(matches!(
+                validate_split_fragment(&encrypted, password),
+                Err(Error::FeatureDisabled {
+                    feature: "encryption"
+                })
+            ));
+        }
 
         let plain = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
         validate_split_fragment(&plain, None).unwrap();
@@ -3553,9 +3573,17 @@ mod tests {
 
         let mut new_encryption = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
         new_encryption.encrypted = true;
+        #[cfg(feature = "encryption")]
         assert!(matches!(
             validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
             Err(Error::InvalidHeader(_))
+        ));
+        #[cfg(not(feature = "encryption"))]
+        assert!(matches!(
+            validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
+            Err(Error::FeatureDisabled {
+                feature: "encryption"
+            })
         ));
 
         let same = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
@@ -3620,6 +3648,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_stored_split_checks_the_final_crc_mac() {
         let data = b"Hello, RAR 5.0 fixture world.\n";
         let bytes = Rar50Writer::new(
@@ -3720,6 +3749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_buffered_crc_verification_requires_keys_and_checks_mac() {
         let data = b"MAC checked payload";
         let keys = Rar50Keys::derive(b"pw", [3; 16], 0).unwrap();

@@ -1371,7 +1371,13 @@ mod tests {
                 super::WriterOptions::new(crate::ArchiveVersion::Rar50, features),
                 super::ArchiveExtras::default(),
             ),
-            crate::Error::NeedPassword
+            if cfg!(feature = "encryption") {
+                crate::Error::NeedPassword
+            } else {
+                crate::Error::FeatureDisabled {
+                    feature: "encryption",
+                }
+            }
         );
     }
 
@@ -1440,6 +1446,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn volume_header_password_can_encrypt_headers_without_encrypting_member_data() {
         let mut features = crate::FeatureSet::store_only();
         features.header_encryption = true;
@@ -1472,6 +1479,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn header_encryption_rejects_conflicting_member_password_before_output() {
         let mut features = crate::FeatureSet::store_only();
         features.header_encryption = true;
@@ -1510,6 +1518,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn quick_open_with_encrypted_headers_is_rejected_by_plan_validation() {
         let mut features = crate::FeatureSet::store_only();
         features.quick_open = true;
@@ -1546,11 +1555,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "recovery")]
     fn invalid_writer_inputs_and_internal_failures_have_distinct_categories() {
         for error in [
             super::validate_file_entry(b"").unwrap_err(),
+            #[cfg(feature = "encryption")]
             super::validate_nonempty_password(b"").unwrap_err(),
+            #[cfg(feature = "recovery")]
             super::validate_recovery_percent(101).unwrap_err(),
             super::filter_policy::dictionary_size_fields(0, 0).unwrap_err(),
             super::filter_policy::dictionary_size_fields(1, 131073).unwrap_err(),
@@ -1559,6 +1569,20 @@ mod tests {
         ] {
             assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument, "{error}");
         }
+        #[cfg(not(feature = "encryption"))]
+        assert_eq!(
+            super::validate_nonempty_password(b"").unwrap_err(),
+            Error::FeatureDisabled {
+                feature: "encryption"
+            }
+        );
+        #[cfg(not(feature = "recovery"))]
+        assert_eq!(
+            super::validate_recovery_percent(101).unwrap_err(),
+            Error::FeatureDisabled {
+                feature: "recovery"
+            }
+        );
         let mut volumes = super::CollectedVolumes::default();
         let error = super::VolumeSink::start_volume(&mut volumes, 1)
             .err()
@@ -1568,6 +1592,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_allowance_admits_before_reading_and_preserves_cbc_tails() {
         use crate::codec::workspace::Allowance;
         let keys = Rar50Keys::derive(b"test password", [7; 16], 0).unwrap();
@@ -1607,6 +1632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_allowance_releases_buffers_on_io_failure_and_cancellation() {
         use crate::codec::workspace::Allowance;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2300,6 +2326,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_streaming_writer_round_trips_across_input_blocks() {
         let data = b"encrypted bounded streaming member data\n".repeat(40_000);
         let entry = ArchiveEntry::new(

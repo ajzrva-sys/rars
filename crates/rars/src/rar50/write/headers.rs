@@ -6,6 +6,10 @@
 //! against the writer resource policy.
 
 use super::ArchiveMetadataEntry;
+#[cfg(test)]
+use crate::crc32::crc32;
+#[cfg(all(test, feature = "encryption"))]
+use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::{Rar50Keys, WRITE_KDF_COUNT_LOG};
 use crate::rar50::framing::{checked_image_len, image_size_error, HeaderImage, HeaderScratch};
 use crate::rar50::{
@@ -16,8 +20,6 @@ use crate::rar50::{
 };
 use crate::streaming::preparation::Bytes;
 use crate::WriterResources;
-#[cfg(test)]
-use crate::{crc32::crc32, crypto::rar50::Rar50Cipher};
 use crate::{Error, Result};
 
 pub(crate) trait HeaderOutput {
@@ -624,11 +626,21 @@ mod prepared_header_tests {
 
     #[test]
     fn exact_images_match_existing_serialization_and_include_encryption_padding() {
+        #[cfg(feature = "encryption")]
         let keys = header_encryption_keys(b"secret").unwrap();
         for len in [0, 1, 15, 16, 120, 127, 128, 16384] {
             let specific = vec![0x51; len];
-            for encrypted in [false, true] {
-                let key = encrypted.then_some(&keys);
+            for encrypted in crate::test_features::encryption_cases() {
+                let key = {
+                    #[cfg(feature = "encryption")]
+                    {
+                        encrypted.then_some(&keys)
+                    }
+                    #[cfg(not(feature = "encryption"))]
+                    {
+                        None
+                    }
+                };
                 let expected = block_header_image(
                     2,
                     HFL_EXTRA,
@@ -680,13 +692,16 @@ mod prepared_header_tests {
                 assert_eq!(header.bytes.capacity(), size);
                 assert!(resources.clone().reserve_prepared_header(1).is_err());
                 if encrypted {
-                    let iv = header[..16].try_into().unwrap();
-                    let mut plain = header[16..].to_vec();
-                    Rar50Cipher::new(keys.keys.key, iv)
-                        .decrypt_in_place(&mut plain)
-                        .unwrap();
-                    assert_eq!(&plain[..expected.len()], expected.as_slice());
-                    assert!(plain[expected.len()..].iter().all(|byte| *byte == 0));
+                    #[cfg(feature = "encryption")]
+                    {
+                        let iv = header[..16].try_into().unwrap();
+                        let mut plain = header[16..].to_vec();
+                        Rar50Cipher::new(keys.keys.key, iv)
+                            .decrypt_in_place(&mut plain)
+                            .unwrap();
+                        assert_eq!(&plain[..expected.len()], expected.as_slice());
+                        assert!(plain[expected.len()..].iter().all(|byte| *byte == 0));
+                    }
                 } else {
                     assert_eq!(&*header, expected.as_slice());
                 }
@@ -893,6 +908,7 @@ mod image_tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_images_match_buffered_ciphertext_and_leave_trailing_data_plain() {
         let keys = header_encryption_keys(b"secret").unwrap();
         for size in [0, 1, 15, 16, 17, 127, 128, 16384] {

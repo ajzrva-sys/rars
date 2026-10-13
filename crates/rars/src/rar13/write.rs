@@ -1209,6 +1209,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_extraction_preserves_output_io_failures() {
         struct FailingWriter;
         impl std::io::Write for FailingWriter {
@@ -1272,7 +1273,8 @@ mod tests {
 
     #[test]
     fn reader_workspace_rar13_stored_archives_need_no_dictionary_allocation() {
-        for password in [None, Some(&b"pw"[..])] {
+        for encrypted in crate::test_features::encryption_cases() {
+            let password = encrypted.then_some(b"pw".as_slice());
             let input = [StoredEntry {
                 name: b"stored.bin",
                 data: b"stored payload",
@@ -1301,7 +1303,8 @@ mod tests {
     fn reader_workspace_rar13_refusals_release_dictionary_input_and_stream_buffers() {
         use crate::codec::workspace::RefusingBudget;
         let data = b"abcabcabc".repeat(64);
-        for password in [None, Some(&b"pw"[..])] {
+        for encrypted in crate::test_features::encryption_cases() {
+            let password = encrypted.then_some(b"pw".as_slice());
             let input = [FileEntry {
                 name: b"compressed.bin",
                 data: &data,
@@ -1829,6 +1832,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn writes_and_reads_encrypted_stored_archive() {
         let input = [StoredEntry {
             name: b"secret.txt",
@@ -2184,6 +2188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn writes_and_reads_encrypted_compressed_archive() {
         let input = [FileEntry {
             name: b"secret.txt",
@@ -2366,10 +2371,19 @@ mod tests {
             ..WriterOptions::default()
         };
         let err = write_stored_archive(&[], options).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "header encryption is not supported by rar14"
-        );
+        if cfg!(feature = "encryption") {
+            assert_eq!(
+                err.to_string(),
+                "header encryption is not supported by rar14"
+            );
+        } else {
+            assert_eq!(
+                err,
+                Error::FeatureDisabled {
+                    feature: "encryption"
+                }
+            );
+        }
     }
 
     #[test]
@@ -3071,6 +3085,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn extract_to_encrypted_archive_reads_through_file_backed_decrypted_range() {
         // The Memory-backed path is already exercised; this test takes the
         // same encrypted archive out to disk so copy_decrypted_range_to runs

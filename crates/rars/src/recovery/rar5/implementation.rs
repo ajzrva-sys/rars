@@ -2089,7 +2089,7 @@ mod legacy_reference {
     }
 }
 
-#[cfg(all(test, feature = "write"))]
+#[cfg(test)]
 mod tests {
     use super::{
         apply_inverse_matrix, build_inline_recovery_data_for_plan,
