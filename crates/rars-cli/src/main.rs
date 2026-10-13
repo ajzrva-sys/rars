@@ -134,6 +134,17 @@ fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
     )
 }
 
+/// The archive name of the entry an extraction error is attributed to.
+fn failed_entry_name(error: &rars::Error) -> Option<&[u8]> {
+    match error {
+        rars::Error::AtEntry { name, .. } => Some(name),
+        rars::Error::AtArchiveOffset { source, .. } | rars::Error::InVolume { source, .. } => {
+            failed_entry_name(source)
+        }
+        _ => None,
+    }
+}
+
 fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u64)> {
     match error {
         rars::Error::Rar50BufferedDecodeLimitExceeded { limit, required } => {
@@ -702,15 +713,21 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         let options = args
             .read_options
             .options(password_bytes(&password), scratch.as_ref());
-        extract_single_archive(&archive, options, &state).map_err(|err| {
-            classify_rars_error(err, |err| {
-                format!(
-                    "failed to write extracted entry to '{}': {err}{}",
-                    out_dir.display(),
-                    rar50_buffered_decode_limit_hint(err)
-                )
+        extract_single_archive(&archive, options, &state)
+            // Keep the members that verified before the failure. The extraction
+            // error is the one to report, even if publishing them also fails.
+            .inspect_err(|err| {
+                let _ = state.borrow_mut().publish_before_failure(err);
             })
-        })?;
+            .map_err(|err| {
+                classify_rars_error(err, |err| {
+                    format!(
+                        "failed to write extracted entry to '{}': {err}{}",
+                        out_dir.display(),
+                        rar50_buffered_decode_limit_hint(err)
+                    )
+                })
+            })?;
         let outputs = state.into_inner().publish()?;
         restore_output_metadata(&outputs).map_err(|err| {
             CliError::general(format!(
@@ -732,19 +749,25 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         let options = args
             .read_options
             .options(password_bytes(&password), scratch.as_ref());
-        extract_volume_archives(&archives, options, &state).map_err(|err| {
-            classify_rars_error(err, |err| {
-                format!(
-                    "failed to extract volume set '{}': {err}{}",
-                    paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    rar50_buffered_decode_limit_hint(err)
-                )
+        extract_volume_archives(&archives, options, &state)
+            // Keep the members that verified before the failure. The extraction
+            // error is the one to report, even if publishing them also fails.
+            .inspect_err(|err| {
+                let _ = state.borrow_mut().publish_before_failure(err);
             })
-        })?;
+            .map_err(|err| {
+                classify_rars_error(err, |err| {
+                    format!(
+                        "failed to extract volume set '{}': {err}{}",
+                        paths
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        rar50_buffered_decode_limit_hint(err)
+                    )
+                })
+            })?;
         let outputs = state.into_inner().publish()?;
         restore_output_metadata(&outputs).map_err(|err| {
             CliError::general(format!(
@@ -772,6 +795,12 @@ struct ExtractOutputState<'a> {
     staged_redirections: HashSet<PathBuf>,
     staged_directories: HashSet<PathBuf>,
     directory_times: Vec<(PathBuf, std::time::SystemTime)>,
+    /// Raw archive name of each output, as extraction errors report it.
+    archive_names: Vec<Vec<u8>>,
+    /// Outputs before this index have been moved to their destinations.
+    published: usize,
+    published_identities: HashSet<PathBuf>,
+    published_paths: HashMap<PathBuf, PathBuf>,
 }
 
 impl<'a> ExtractOutputState<'a> {
@@ -789,10 +818,24 @@ impl<'a> ExtractOutputState<'a> {
             staged_redirections: HashSet::new(),
             staged_directories: HashSet::new(),
             directory_times: Vec::new(),
+            archive_names: Vec::new(),
+            published: 0,
+            published_identities: HashSet::new(),
+            published_paths: HashMap::new(),
         }
     }
 
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
+        self.open_entry_named(meta, &meta.name)
+    }
+
+    /// Open an entry whose name was re-decoded, remembering its archive name.
+    fn open_entry_named(
+        &mut self,
+        meta: &rars::ExtractedEntryMeta,
+        archive_name: &[u8],
+    ) -> rars::Result<Box<dyn Write>> {
+        self.publish_verified()?;
         let planned = output_path_for_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
         let destination = output_path_for_entry(self.out_dir, meta)?;
@@ -801,6 +844,7 @@ impl<'a> ExtractOutputState<'a> {
         let (path, writer) =
             open_output_writer(&staging, meta, OverwritePolicy::Never, Backslash::Separator)?;
         self.record_staged_path(&path, meta.is_directory)?;
+        self.archive_names.push(archive_name.to_vec());
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
             path: destination,
@@ -815,6 +859,7 @@ impl<'a> ExtractOutputState<'a> {
         &mut self,
         meta: &rars::rar50::ExtractedEntryMeta,
     ) -> rars::Result<Box<dyn Write>> {
+        self.publish_verified()?;
         let common = rar50_extracted_meta(meta);
         let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
@@ -829,6 +874,7 @@ impl<'a> ExtractOutputState<'a> {
         )?;
         self.record_staged_path(&path, common.is_directory)?;
         self.record_rar50_created_path(meta, path.clone())?;
+        self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
             path: destination,
@@ -844,6 +890,7 @@ impl<'a> ExtractOutputState<'a> {
         meta: &rars::rar50::ExtractedEntryMeta,
         redirection: &rars::rar50::FileRedirection,
     ) -> rars::Result<()> {
+        self.publish_verified()?;
         let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
         let destination = output_path_for_rar50_entry(self.out_dir, meta)?;
@@ -864,6 +911,7 @@ impl<'a> ExtractOutputState<'a> {
                 .insert(path.clone(), target.to_path_buf());
         }
         self.record_rar50_created_path(meta, path.clone())?;
+        self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
             path: destination,
@@ -956,34 +1004,38 @@ impl<'a> ExtractOutputState<'a> {
         Ok(())
     }
 
-    fn publish(self) -> rars::Result<Vec<ExtractedOutput>> {
-        // Decoding and checksum verification have succeeded for the complete call.
+    /// Move every staged output to its destination. The library extracts
+    /// members one at a time and verifies each before asking for the next
+    /// output, so everything staged before a new callback has passed its
+    /// checksum. Publishing here keeps verified members when a later one fails
+    /// and holds at most one member in staging.
+    fn publish_verified(&mut self) -> rars::Result<()> {
         // Publish new inodes rather than truncating any existing hard-link target.
-        let mut published = HashSet::new();
-        let mut published_paths = HashMap::new();
-        for (output, staged) in self.outputs.iter().zip(&self.staged_paths) {
-            let relative = output
+        while self.published < self.outputs.len() {
+            let staged = self.staged_paths[self.published].clone();
+            let relative = self.outputs[self.published]
                 .path
                 .strip_prefix(self.out_dir)
-                .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
-            let destination = output::checked_output_path(self.out_dir, relative)?;
+                .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?
+                .to_path_buf();
+            let destination = output::checked_output_path(self.out_dir, &relative)?;
             if let Some(staging) = &self.staging {
                 staging.reject_alias(&destination)?;
             }
             if let Ok(identity) = fs::canonicalize(&destination) {
-                if published.contains(&identity) {
+                if self.published_identities.contains(&identity) {
                     return Err(rars::Error::InvalidHeader(
                         "multiple archive entries map to the same output path",
                     ));
                 }
             }
-            if fs::symlink_metadata(staged)?.is_dir() {
+            if fs::symlink_metadata(&staged)?.is_dir() {
                 fs::create_dir_all(&destination)?;
             } else {
                 fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
-                output::checked_output_path(self.out_dir, relative)?;
+                output::checked_output_path(self.out_dir, &relative)?;
                 if self.overwrite == OverwritePolicy::Always
-                    && self.staged_redirections.contains(staged)
+                    && self.staged_redirections.contains(&staged)
                 {
                     match fs::symlink_metadata(&destination) {
                         Ok(metadata) if metadata.is_dir() => fs::remove_dir(&destination)?,
@@ -992,30 +1044,57 @@ impl<'a> ExtractOutputState<'a> {
                         Err(error) => return Err(error.into()),
                     }
                 }
+                // A hard link's target was published before the link was staged.
                 let hardlink_target = self
                     .hardlink_targets
-                    .get(staged)
-                    .and_then(|target| published_paths.get(target))
-                    .map(PathBuf::as_path);
+                    .get(&staged)
+                    .map(|target| self.published_paths.get(target).unwrap_or(target).as_path());
                 output::publish_verified_output(
-                    staged,
+                    &staged,
                     &destination,
                     self.overwrite,
                     hardlink_target,
                 )?;
             }
-            published_paths.insert(staged.clone(), destination.clone());
+            // Later redirections resolve this entry at its published location.
+            if self.created_paths.get(&relative) == Some(&staged) {
+                self.created_paths
+                    .insert(relative.clone(), destination.clone());
+            }
+            self.published_paths
+                .insert(staged.clone(), destination.clone());
             // Symlinks may be dangling; their destination entries were reserved above.
             if let Ok(identity) = fs::canonicalize(&destination) {
                 if !fs::symlink_metadata(&destination)?.file_type().is_symlink() {
-                    published.insert(identity);
+                    self.published_identities.insert(identity);
                 }
             }
+            self.published += 1;
         }
+        Ok(())
+    }
+
+    /// Keep what verified before `error`. The library reports a failure before
+    /// asking for another output, so the last staged member is verified only
+    /// when the error names a different entry. Without a name it is discarded.
+    fn publish_before_failure(&mut self, error: &rars::Error) -> rars::Result<()> {
+        let last_verified = matches!(
+            (failed_entry_name(error), self.archive_names.last()),
+            (Some(failed), Some(last)) if failed != last.as_slice()
+        );
+        if !last_verified && self.outputs.len() > self.published {
+            self.outputs.pop();
+        }
+        self.publish_verified()
+    }
+
+    /// Publish the final member once the whole extraction call has succeeded.
+    fn publish(mut self) -> rars::Result<Vec<ExtractedOutput>> {
+        self.publish_verified()?;
         for (path, modified) in &self.directory_times {
             output::set_modified_time(path, *modified)?;
         }
-        Ok(self.outputs)
+        Ok(std::mem::take(&mut self.outputs))
     }
 
     fn record_rar50_created_path(
@@ -1064,7 +1143,7 @@ fn extract_single_archive(
                 options.legacy_name_encoding,
             )?
             .into_owned();
-            state.borrow_mut().open_entry(&decoded)
+            state.borrow_mut().open_entry_named(&decoded, &meta.name)
         }),
     }
 }
@@ -1108,7 +1187,7 @@ fn extract_volume_archives(
             options.legacy_name_encoding,
         )?
         .into_owned();
-        state.borrow_mut().open_entry(&decoded)
+        state.borrow_mut().open_entry_named(&decoded, &meta.name)
     })
 }
 

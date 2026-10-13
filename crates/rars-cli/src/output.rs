@@ -822,7 +822,9 @@ mod tests {
                     "archive path conflicts with extraction storage"
                 ))
             ));
-            assert_eq!(fs::read_dir(&storage).unwrap().count(), 1);
+            // The earlier member was published before the alias was refused.
+            assert_eq!(fs::read_dir(&storage).unwrap().count(), 0);
+            assert!(root.join("ordinary").exists());
         } else {
             assert!(result.is_ok());
         }
@@ -1024,7 +1026,8 @@ mod tests {
                     );
                     if overwrite == OverwritePolicy::Never {
                         assert!(staged.is_err());
-                        assert!(!root.join("source").exists());
+                        // The earlier member was verified, so it is kept.
+                        assert_eq!(fs::read(root.join("source")).unwrap(), b"payload");
                         continue;
                     }
                     staged.unwrap();

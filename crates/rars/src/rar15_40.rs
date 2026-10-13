@@ -1512,11 +1512,15 @@ impl Archive {
         while files.peek().is_some() {
             options.check_cancelled()?;
             let batch = files.by_ref().take(window).collect();
-            let entries = crate::parallel::map_collect(batch, |file| {
+            // Write the verified members ahead of a failure before reporting it.
+            let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
                 decode_parallel_entry(self, file, options)
-            })?;
+            });
             for entry in entries {
                 write_parallel_entry(entry, &mut open, &publication)?;
+            }
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
         options.check_cancelled()?;

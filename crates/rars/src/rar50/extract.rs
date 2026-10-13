@@ -928,7 +928,8 @@ impl Archive {
                 remaining -= file.unpacked_size;
                 batch.push(files.next().expect("peeked file"));
             }
-            let entries = crate::parallel::map_collect(batch, |file| {
+            // Write the verified members ahead of a failure before reporting it.
+            let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
                 decode_parallel_entry(
                     self,
                     file,
@@ -937,9 +938,12 @@ impl Archive {
                     options,
                     verification,
                 )
-            })?;
+            });
             for entry in entries {
                 write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication)?;
+            }
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
         options.check_cancelled()?;

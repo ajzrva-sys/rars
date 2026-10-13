@@ -60,7 +60,7 @@ fn overwriting_an_output_hard_link_preserves_its_outside_target() {
 }
 
 #[test]
-fn checksum_failure_preserves_existing_files_and_cleans_staging() {
+fn checksum_failure_keeps_verified_members_and_existing_files() {
     for version in [
         ArchiveVersion::Rar14,
         ArchiveVersion::Rar29,
@@ -92,12 +92,18 @@ fn checksum_failure_preserves_existing_files_and_cleans_staging() {
             fs::read(destination.join("file.txt")).unwrap(),
             b"keep existing contents"
         );
-        assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
+        // Each member is published once verified, so a later failure keeps
+        // the earlier one and leaves no staging behind.
+        assert_eq!(
+            fs::read(destination.join("earlier.txt")).unwrap(),
+            b"valid earlier member"
+        );
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 2);
     }
 }
 
 #[test]
-fn later_integrity_failure_preserves_empty_redirection_destination_directory() {
+fn later_integrity_failure_keeps_verified_redirection_over_empty_directory() {
     let root = scratch::case("extraction-redirection-directory-checksum");
     let archive_path = root.join("archive.rar");
     let fixture = rars::ArchiveReader::read_owned(
@@ -163,11 +169,12 @@ fn later_integrity_failure_preserves_empty_redirection_destination_directory() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(existing.is_dir());
-    assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
-    assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
-    assert!(!destination.join("file.txt").exists());
+    // The file and its redirection were verified before later.txt failed, so
+    // both are published; the redirection replaces the empty directory.
+    assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"test\n");
+    assert_eq!(fs::read(&existing).unwrap(), b"test\n");
     assert!(!destination.join("later.txt").exists());
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
 }
 
 #[test]
@@ -212,7 +219,12 @@ fn case_aliases_are_refused_on_insensitive_filesystems_and_kept_on_sensitive_one
     if insensitive {
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains("same output path"));
-        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+        // The first name was verified and published before its alias was refused.
+        assert_eq!(
+            fs::read(destination.join("A.txt")).unwrap(),
+            b"first contents"
+        );
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
     } else {
         assert!(
             result.status.success(),

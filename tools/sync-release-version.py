@@ -32,6 +32,14 @@ def main() -> None:
         rf"\g<1>{version}\g<2>",
         "release workflow default ref",
     )
+    # The independent reader consumer has its own lockfile, which cargo-release
+    # does not touch. CI checks it with --locked.
+    replace_once(
+        root / "scripts/reader-consumer/Cargo.lock",
+        r'^(name = "rars"\nversion = ")[^"]+(")$',
+        rf"\g<1>{version}\g<2>",
+        "reader consumer rars lock entry",
+    )
 
 
 if __name__ == "__main__":

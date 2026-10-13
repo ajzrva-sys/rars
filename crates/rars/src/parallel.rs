@@ -38,14 +38,24 @@ mod threaded {
             .for_each(|(index, item)| apply(index, item));
     }
 
-    pub(crate) fn map_collect<T, O, E, F>(items: Vec<T>, map: F) -> Result<Vec<O>, E>
+    /// Maps `items` in parallel and returns, in order, the outputs before the
+    /// first failure together with that failure, so a caller can still publish
+    /// the successful prefix.
+    pub(crate) fn map_prefix<T, O, E, F>(items: Vec<T>, map: F) -> (Vec<O>, Option<E>)
     where
         T: Send,
         O: Send,
         E: Send,
         F: Fn(T) -> Result<O, E> + Sync + Send,
     {
-        items.into_par_iter().map(map).collect()
+        let mut outputs = Vec::with_capacity(items.len());
+        for result in items.into_par_iter().map(map).collect::<Vec<_>>() {
+            match result {
+                Ok(output) => outputs.push(output),
+                Err(error) => return (outputs, Some(error)),
+            }
+        }
+        (outputs, None)
     }
 
     /// Maps `items` in parallel but keeps only a window of results alive,
@@ -108,14 +118,21 @@ mod sequential {
             .for_each(|(index, item)| apply(index, item));
     }
 
-    pub(crate) fn map_collect<T, O, E, F>(items: Vec<T>, map: F) -> Result<Vec<O>, E>
+    pub(crate) fn map_prefix<T, O, E, F>(items: Vec<T>, map: F) -> (Vec<O>, Option<E>)
     where
         T: Send,
         O: Send,
         E: Send,
         F: Fn(T) -> Result<O, E> + Sync + Send,
     {
-        items.into_iter().map(map).collect()
+        let mut outputs = Vec::with_capacity(items.len());
+        for item in items {
+            match map(item) {
+                Ok(output) => outputs.push(output),
+                Err(error) => return (outputs, Some(error)),
+            }
+        }
+        (outputs, None)
     }
 
     /// One at a time, so the window only decides how much output is alive at
@@ -161,13 +178,14 @@ mod tests {
         sequential::for_each_mut(&mut slots, |index, slot| *slot += index);
         assert_eq!(slots, [7, 8, 9]);
         sequential::for_each_mut::<usize, _>(&mut [], |_, _| panic!("empty callback"));
-        let mapped: Result<Vec<_>, ()> = sequential::map_collect(vec![3, 1, 2], |x| Ok(x * 2));
-        assert_eq!(mapped, Ok(vec![6, 2, 4]));
-        let empty: Result<Vec<usize>, ()> =
-            sequential::map_collect(Vec::<usize>::new(), |_| panic!("empty map"));
-        assert_eq!(empty, Ok(vec![]));
+        let mapped = sequential::map_prefix(vec![3, 1, 2], |x| Ok::<_, ()>(x * 2));
+        assert_eq!(mapped, (vec![6, 2, 4], None));
+        let empty = sequential::map_prefix(Vec::<usize>::new(), |_| -> Result<usize, ()> {
+            panic!("empty map")
+        });
+        assert_eq!(empty, (vec![], None));
         let visited = std::sync::Mutex::new(Vec::new());
-        let mapped = sequential::map_collect(vec![3, 1, 2], |x| {
+        let mapped = sequential::map_prefix(vec![3, 1, 2], |x| {
             visited.lock().unwrap().push(x);
             if x == 1 {
                 Err(11)
@@ -175,7 +193,7 @@ mod tests {
                 Ok(x)
             }
         });
-        assert_eq!(mapped, Err(11));
+        assert_eq!(mapped, (vec![3], Some(11)));
         assert_eq!(*visited.lock().unwrap(), [3, 1]);
         assert_eq!(sequential::default_window(), 1);
         assert_eq!(sequential::threads(), 1);
