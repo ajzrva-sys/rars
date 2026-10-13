@@ -552,6 +552,14 @@ impl Unpack50Decoder {
     }
 }
 
+/// Buffered workers may discard state they will never use. Public and stateful
+/// decoding retains history; solid and limited decoding always overrides this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryRetention {
+    Retain,
+    DiscardIndependent,
+}
+
 #[derive(Debug)]
 pub(crate) struct ReaderState<B: Budget> {
     pub(crate) read_control: crate::read_control::ReadControl,
@@ -638,15 +646,38 @@ impl<B: Budget> ReaderState<B> {
         solid: bool,
         mode: DecodeMode,
     ) -> Result<Buffer<u8, B>> {
+        self.decode_member_with_dictionary_and_history(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            mode,
+            HistoryRetention::Retain,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_member_with_dictionary_and_history(
+        &mut self,
+        input: &[u8],
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
+        mode: DecodeMode,
+        history: HistoryRetention,
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         let mut input = std::io::Cursor::new(input);
-        self.decode_member_from_reader_with_dictionary(
+        self.decode_member_from_reader_with_dictionary_and_history(
             &mut input,
             algorithm_version,
             output_size,
             dictionary_size,
             solid,
             mode,
+            history,
         )
     }
 
@@ -679,6 +710,28 @@ impl<B: Budget> ReaderState<B> {
         dictionary_size: usize,
         solid: bool,
         mode: DecodeMode,
+    ) -> Result<Buffer<u8, B>> {
+        self.decode_member_from_reader_with_dictionary_and_history(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            mode,
+            HistoryRetention::Retain,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_member_from_reader_with_dictionary_and_history(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
+        mode: DecodeMode,
+        history: HistoryRetention,
     ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
@@ -811,7 +864,9 @@ impl<B: Budget> ReaderState<B> {
         }
 
         if output.len() == output_size {
-            let history_output = if mode.applies_filters() && !filters.is_empty() {
+            let retain_history = B::LIMITED || solid || history == HistoryRetention::Retain;
+            let history_output = if retain_history && mode.applies_filters() && !filters.is_empty()
+            {
                 Some(Buffer::copied(
                     &output[output.len().saturating_sub(dictionary_size)..],
                     &allowance,
@@ -828,10 +883,12 @@ impl<B: Budget> ReaderState<B> {
                     &allowance,
                 )?;
             }
-            self.remember_history(
-                history_output.as_deref().unwrap_or(&output),
-                dictionary_size,
-            )?;
+            if retain_history {
+                self.remember_history(
+                    history_output.as_deref().unwrap_or(&output),
+                    dictionary_size,
+                )?;
+            }
             Ok(output)
         } else {
             Err(Error::NeedMoreInput)
@@ -1864,3 +1921,7 @@ mod bit_reader_tests;
 #[cfg(test)]
 #[path = "rar50/checkpoint_tests.rs"]
 mod checkpoint_tests;
+
+#[cfg(all(test, feature = "write"))]
+#[path = "rar50/history_retention_tests.rs"]
+mod history_retention_tests;

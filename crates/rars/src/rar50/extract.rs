@@ -1,7 +1,9 @@
 #[path = "scratch.rs"]
 mod scratch;
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
-use crate::codec::rar50::{DecodeMode, DecodedChunk, ReaderState, StreamDecodeError};
+use crate::codec::rar50::{
+    DecodeMode, DecodedChunk, HistoryRetention, ReaderState, StreamDecodeError,
+};
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
 #[cfg(feature = "encryption")]
@@ -432,13 +434,28 @@ impl FileHeader {
         decoder: &mut ReaderState<B>,
         password: Option<&[u8]>,
     ) -> Result<DecodedData<B>> {
+        self.decoded_data_with_decoder_and_history(
+            archive,
+            decoder,
+            password,
+            HistoryRetention::Retain,
+        )
+    }
+
+    fn decoded_data_with_decoder_and_history<B: Budget>(
+        &self,
+        archive: &Archive,
+        decoder: &mut ReaderState<B>,
+        password: Option<&[u8]>,
+        history: HistoryRetention,
+    ) -> Result<DecodedData<B>> {
         let (packed, keys) = self.packed_data_with_allowance(
             archive,
             password,
             &decoder.read_control,
             &decoder.allowance(),
         )?;
-        let data = self.decode_packed_owned(&packed, decoder)?;
+        let data = self.decode_packed_owned(&packed, decoder, history)?;
         Ok(DecodedData { data, keys })
     }
 
@@ -446,6 +463,7 @@ impl FileHeader {
         &self,
         packed: &[u8],
         decoder: &mut ReaderState<B>,
+        history: HistoryRetention,
     ) -> Result<Buffer<u8, B>> {
         if self.is_stored() {
             if self.encrypted {
@@ -484,13 +502,14 @@ impl FileHeader {
         })?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
         decoder
-            .decode_member_with_dictionary(
+            .decode_member_with_dictionary_and_history(
                 packed,
                 info.algorithm_version,
                 output_size,
                 dictionary_size,
                 info.solid,
                 DecodeMode::Lz,
+                history,
             )
             .map_err(Error::from)
     }
@@ -653,7 +672,7 @@ impl FileHeader {
         packed: &[u8],
         decoder: &mut ReaderState<Allowance>,
     ) -> Result<Vec<u8>> {
-        self.decode_packed_owned(packed, decoder)
+        self.decode_packed_owned(packed, decoder, HistoryRetention::Retain)
             .map(Buffer::into_vec)
     }
 
@@ -1071,15 +1090,30 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
+    // Only a disposable buffered worker can omit the final dictionary copy.
+    // Compression metadata is still validated at its original decode boundary;
+    // ReaderState also forces retention for solid and limited decoding.
+    let history = if !B::LIMITED
+        && !archive.main.is_solid()
+        && !file.is_split_before()
+        && !file.is_split_after()
+        && !file.is_stored()
+        && session.scratch.is_none()
+        && !file.should_stream_decode(buffered_decode_limit)
+    {
+        HistoryRetention::DiscardIndependent
+    } else {
+        HistoryRetention::Retain
+    };
     if verification {
         budget.run(&file.name, std::io::sink(), |writer| {
-            session.write_file_to(archive, file, writer)
+            session.write_file_to_with_history(archive, file, writer, history)
         })?;
         return Ok(ParallelExtractedEntry::Verified(meta));
     }
     let mut data = Buffer::new(allowance);
     budget.run(&file.name, &mut data, |writer| {
-        session.write_file_to(archive, file, writer)
+        session.write_file_to_with_history(archive, file, writer, history)
     })?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
@@ -1148,6 +1182,16 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        self.write_file_to_with_history(archive, file, writer, HistoryRetention::Retain)
+    }
+
+    fn write_file_to_with_history(
+        &mut self,
+        archive: &Archive,
+        file: &FileHeader,
+        writer: &mut dyn Write,
+        history: HistoryRetention,
+    ) -> Result<()> {
         if file.is_stored() {
             return file.write_stored_with_allowance(
                 archive,
@@ -1160,7 +1204,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             return self.stream_file_to(archive, file, writer);
         }
         let decoded = self
-            .decoded_file_data(archive, file)
+            .decoded_file_data(archive, file, history)
             .map_err(|error| file.entry_error("decoding", error))?;
         file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref())
             .map_err(|error| file.entry_error("verifying", error))?;
@@ -1197,8 +1241,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         &mut self,
         archive: &Archive,
         file: &FileHeader,
+        history: HistoryRetention,
     ) -> Result<DecodedData<B>> {
-        file.decoded_data_with_decoder(archive, &mut self.decoder, self.password)
+        file.decoded_data_with_decoder_and_history(
+            archive,
+            &mut self.decoder,
+            self.password,
+            history,
+        )
     }
 
     fn split_decryptor(
@@ -4062,3 +4112,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "write"))]
+#[path = "independent_history_tests.rs"]
+mod independent_history_tests;
