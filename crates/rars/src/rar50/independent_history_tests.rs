@@ -111,7 +111,7 @@ fn independent_history_public_extraction_keeps_all_filter_bytes_and_bounded_rout
     }
 }
 #[test]
-fn independent_history_verification_keeps_only_the_ordered_verified_prefix() {
+fn independent_history_extraction_keeps_only_the_ordered_verified_prefix() {
     for filter in [None, Some(FilterKind::Delta { channels: 2 })] {
         for hash_failure in [false, true] {
             let (mut archive, data) = archive(ArchiveVersion::Rar50, filter);
@@ -195,7 +195,9 @@ fn entry_result<B: Budget>(
     value
         .map(|entry| match entry {
             ParallelExtractedEntry::File { meta, data } => (format!("{meta:?}"), data.to_vec()),
-            ParallelExtractedEntry::Directory(meta) => (format!("{meta:?}"), Vec::new()),
+            ParallelExtractedEntry::Directory(meta) | ParallelExtractedEntry::Verified(meta) => {
+                (format!("{meta:?}"), Vec::new())
+            }
             ParallelExtractedEntry::Redirection { meta, redirection } => {
                 (format!("{meta:?} {redirection:?}"), Vec::new())
             }
@@ -205,14 +207,25 @@ fn entry_result<B: Budget>(
 #[test]
 fn independent_history_worker_limited_keeps_original_attempts_callbacks_and_errors() {
     use crate::codec::workspace::RefusingBudget;
-    for filter in [None, Some(FilterKind::Delta { channels: 2 })] {
+    for (filter, verification) in [None, Some(FilterKind::Delta { channels: 2 })]
+        .into_iter()
+        .flat_map(|filter| [false, true].map(|verification| (filter, verification)))
+    {
         let (archive, _) = archive(ArchiveVersion::Rar50, filter);
         let file = archive.files().next().unwrap();
         let options = crate::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(u64::MAX);
         let baseline = RefusingBudget::new(usize::MAX);
         drop(
-            reference_decode_parallel_entry(&archive, file, None, u64::MAX, options, &baseline)
-                .unwrap(),
+            reference_decode_parallel_entry(
+                &archive,
+                file,
+                None,
+                u64::MAX,
+                options,
+                verification,
+                &baseline,
+            )
+            .unwrap(),
         );
         assert_eq!(baseline.used(), 0);
         for fail_at in 0..=baseline.attempts() {
@@ -237,6 +250,7 @@ fn independent_history_worker_limited_keeps_original_attempts_callbacks_and_erro
                     None,
                     u64::MAX,
                     old_options,
+                    verification,
                     &old,
                 ));
                 let output = entry_result(decode_parallel_entry_with_allowance(
@@ -245,6 +259,7 @@ fn independent_history_worker_limited_keeps_original_attempts_callbacks_and_erro
                     None,
                     u64::MAX,
                     actual_options,
+                    verification,
                     &actual,
                 ));
                 assert_eq!(output, expected, "filter={filter:?}, fail_at={fail_at}");
@@ -336,13 +351,83 @@ fn independent_history_late_publication_cancellation_keeps_the_verified_prefix()
     }
 }
 
-// Original d2 private-worker pipeline, independent of the history selection.
+#[test]
+fn independent_history_metadata_verification_matches_retaining_parent() {
+    for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        for filter in [
+            None,
+            Some(FilterKind::Delta { channels: 2 }),
+            Some(FilterKind::E8),
+            Some(FilterKind::E8E9),
+            Some(FilterKind::Arm),
+        ] {
+            for fault in 0..4 {
+                let (mut archive, _) = archive(version, filter);
+                for block in &mut archive.blocks {
+                    if let Block::File(file) = block {
+                        if file.name == b"first" {
+                            match fault {
+                                1 => file.hash.as_mut().unwrap().data[0] ^= 1,
+                                2 => {
+                                    file.hash = None;
+                                    file.data_crc32 = Some(0);
+                                }
+                                3 => file.unpacked_size += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                let file = archive.files().next().unwrap();
+                for cancelled in [false, true] {
+                    let token = crate::ReadCancellation::new();
+                    if cancelled {
+                        token.cancel();
+                    }
+                    let mut options =
+                        crate::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(u64::MAX);
+                    options.cancellation = Some(&token);
+                    let expected = reference_decode_parallel_entry(
+                        &archive,
+                        file,
+                        None,
+                        u64::MAX,
+                        options,
+                        true,
+                        &Allowance::default(),
+                    );
+                    let actual = decode_parallel_entry_with_allowance(
+                        &archive,
+                        file,
+                        None,
+                        u64::MAX,
+                        options,
+                        true,
+                        &Allowance::default(),
+                    );
+                    if fault == 0 && !cancelled {
+                        assert!(
+                            matches!(&actual, Ok(ParallelExtractedEntry::Verified(meta)) if meta.name == b"first")
+                        );
+                    } else {
+                        assert!(actual.is_err());
+                    }
+                    assert_eq!(entry_result(actual), entry_result(expected));
+                }
+            }
+        }
+    }
+}
+
+// Original d2 extraction pipeline plus674cc32 metadata-only verification,
+// independent of the history selection. The reference always retains history.
 fn reference_decode_parallel_entry<B: Budget>(
     archive: &Archive,
     file: &FileHeader,
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
+    verification: bool,
     allowance: &B,
 ) -> Result<ParallelExtractedEntry<B>> {
     options.check_cancelled()?;
@@ -360,10 +445,16 @@ fn reference_decode_parallel_entry<B: Budget>(
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
-    let mut data = Buffer::new(allowance);
     let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
+    if verification {
+        budget.run(&file.name, std::io::sink(), |writer| {
+            session.write_file_to(archive, file, writer)
+        })?;
+        return Ok(ParallelExtractedEntry::Verified(meta));
+    }
+    let mut data = Buffer::new(allowance);
     budget.run(&file.name, &mut data, |writer| {
         session.write_file_to(archive, file, writer)
     })?;
