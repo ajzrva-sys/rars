@@ -1816,7 +1816,14 @@ fn prints_usage_for_help_command() {
     let output = rars().arg("--help").output().unwrap();
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout = stdout(&output);
-    assert!(stdout.contains("Usage: rars [OPTIONS] <COMMAND>"));
+    let binary_name = Path::new(env!("CARGO_BIN_EXE_rars"))
+        .file_name()
+        .unwrap()
+        .to_string_lossy();
+    assert!(
+        stdout.contains(&format!("Usage: {binary_name} [OPTIONS] <COMMAND>")),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("--threads <N>"));
     assert!(stdout.contains("Exit codes:"));
     assert!(stdout.contains("info"));
@@ -2038,7 +2045,7 @@ fn rar50_add_uses_rar5_host_os_values() {
 
     let parsed = rars::rar50::Archive::parse_path(&archive).unwrap();
     let file = parsed.files().next().unwrap();
-    assert_eq!(file.host_os, 1);
+    assert_eq!(file.host_os, u64::from(cfg!(unix)));
 
     assert_archive_tests_and_extracts_file(
         &archive,
@@ -2182,14 +2189,29 @@ fn extraction_refuses_overwrite_unless_explicitly_allowed() {
         .unwrap();
     assert!(first.status.success(), "stderr: {}", stderr(&first));
 
+    let destination = out_dir.join("hello.txt");
+    let existing = b"existing output must survive\n";
+    fs::write(&destination, existing).unwrap();
+    let native_error = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .unwrap_err();
+    assert_eq!(native_error.kind(), io::ErrorKind::AlreadyExists);
+
     let second = rars()
         .arg("x")
         .arg(&archive)
         .arg(&out_dir)
         .output()
         .unwrap();
-    assert!(!second.status.success());
-    assert!(stderr(&second).contains("File exists"));
+    assert_eq!(second.status.code(), Some(1));
+    assert!(
+        stderr(&second).contains(&native_error.to_string()),
+        "stderr: {}",
+        stderr(&second)
+    );
+    assert_eq!(fs::read(&destination).unwrap(), existing);
 
     let overwrite = rars()
         .args(["x", "--overwrite=always"])
@@ -2199,7 +2221,7 @@ fn extraction_refuses_overwrite_unless_explicitly_allowed() {
         .unwrap();
     assert!(overwrite.status.success(), "stderr: {}", stderr(&overwrite));
     assert_eq!(
-        fs::read(out_dir.join("hello.txt")).unwrap(),
+        fs::read(&destination).unwrap(),
         b"overwrite policy payload\n"
     );
 }
