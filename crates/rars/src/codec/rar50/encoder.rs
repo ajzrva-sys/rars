@@ -2469,6 +2469,16 @@ fn optimal_tokens_in_workspace<B: Budget>(
     let span = end - start;
 
     let allowance = workspace.price.allowance().clone();
+    if !B::LIMITED && matches.runs.is_empty() {
+        // Every parse starts with empty distance memory. Without a collected
+        // match, literals cannot introduce a remembered distance, so they are
+        // the only path through this block under any set of table prices.
+        // Limited parses retain their allocation and refusal order below.
+        return Buffer::collect(
+            combined[block].iter().copied().map(EncodeToken::Literal),
+            &allowance,
+        );
+    }
     let OptimalWorkspace {
         price,
         arrive_length,
@@ -2613,8 +2623,17 @@ fn encode_tokens_with_allowance<B: Budget>(
         let mut lengths =
             table_lengths_with_allowance(&tokens, initial_filters, distance_size, allowance)?;
         let mut best_bits = token_stream_bits(&tokens, initial_filters, &lengths, distance_size)?;
+        // Without a collected match, every pass starts with no remembered
+        // distance and can only produce the same literals. Keep the first
+        // tables and stream validation before skipping the equal reparse.
+        // Limited callers retain every original admission and refusal point.
+        let passes = if !B::LIMITED && matches.runs.is_empty() {
+            1
+        } else {
+            OPTIMAL_PARSE_PASSES
+        };
         let mut best = None;
-        for _ in 1..OPTIMAL_PARSE_PASSES {
+        for _ in 1..passes {
             let prices = TokenPrices {
                 lengths: lengths.slices(),
             };
@@ -3439,3 +3458,7 @@ mod tests;
 #[cfg(test)]
 #[path = "pricing_tests.rs"]
 mod pricing_tests;
+
+#[cfg(test)]
+#[path = "literal_pricing_tests.rs"]
+mod literal_pricing_tests;
