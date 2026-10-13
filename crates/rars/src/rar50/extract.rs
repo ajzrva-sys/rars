@@ -19,6 +19,10 @@ const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 #[cfg(test)]
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 
+#[cfg(all(test, feature = "write"))]
+#[path = "streaming_checks_tests.rs"]
+mod streaming_checks_tests;
+
 impl FileHeader {
     fn check_output_limit(&self, budget: &crate::output_limit::OutputBudget) -> Result<()> {
         if !budget.is_limited() || self.is_directory() || self.redirection.is_some() {
@@ -173,6 +177,10 @@ impl FileHeader {
         self.hash
             .as_ref()
             .is_some_and(|hash| hash.hash_type == 0 && hash.data.len() == 32)
+    }
+
+    fn needs_crc32(&self) -> bool {
+        self.data_crc32.is_some() && !self.blake2sp_supersedes_crc32()
     }
 
     pub(super) fn verify_integrity_with_keys(
@@ -496,6 +504,27 @@ impl FileHeader {
         scratch_policy: Option<&crate::Rar50Scratch>,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        // Split members retain their existing checksum work. Only ordinary
+        // members select the optional policy, independently of scratch decoding.
+        self.stream_packed_with_crc_policy::<false, _, _>(
+            packed,
+            keys,
+            decoder,
+            buffered_decode_limit,
+            scratch_policy,
+            writer,
+        )
+    }
+
+    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool, R: Read, B: Budget>(
+        &self,
+        packed: &mut R,
+        keys: Option<&Rar50Keys>,
+        decoder: &mut ReaderState<B>,
+        buffered_decode_limit: u64,
+        scratch_policy: Option<&crate::Rar50Scratch>,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
         if let Some(policy) = scratch_policy {
             return scratch::decode(self, packed, keys, decoder, policy, writer);
         }
@@ -507,6 +536,7 @@ impl FileHeader {
         let output_size = usize::try_from(self.unpacked_size)
             .map_err(|_| Error::InvalidHeader("RAR 5 unpacked size overflows host address size"))?;
         let mut crc = Crc32::new();
+        let check_crc = !OPTIONAL_CRC || self.needs_crc32();
         let mut hash = streaming_hash_verifier(self)?;
         decoder
             .decode_member_from_reader_with_dictionary_to_sink(
@@ -517,14 +547,24 @@ impl FileHeader {
                 info.solid,
                 |chunk| match chunk {
                     DecodedChunk::Bytes(chunk) => {
-                        crc.update(chunk);
+                        if check_crc {
+                            #[cfg(all(test, feature = "write"))]
+                            streaming_checks_tests::record_crc_work(chunk.len(), false);
+                            crc.update(chunk);
+                        }
                         if let Some((_, hasher)) = &mut hash {
                             hasher.update(chunk);
                         }
                         writer.write_all(chunk)
                     }
                     DecodedChunk::Repeated { byte, len } => {
-                        write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
+                        if check_crc {
+                            write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
+                        } else {
+                            write_repeated_chunk_with_optional_crc(
+                                writer, None, &mut hash, byte, len,
+                            )
+                        }
                     }
                 },
             )
@@ -556,6 +596,7 @@ impl FileHeader {
             .packed_reader_with_allowance(archive, password, allowance)
             .map_err(|error| self.entry_error("decoding", error))?;
         let mut crc = Crc32::new();
+        let check_crc = self.needs_crc32();
         let mut hash =
             streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
         let mut written = 0u64;
@@ -582,7 +623,11 @@ impl FileHeader {
             // chunk_len is bounded by unpacked_size - written, so this sum
             // cannot exceed the declared u64 size, including u64::MAX.
             written += chunk.len() as u64;
-            crc.update(chunk);
+            if check_crc {
+                #[cfg(all(test, feature = "write"))]
+                streaming_checks_tests::record_crc_work(chunk.len(), false);
+                crc.update(chunk);
+            }
             if let Some((_, hasher)) = &mut hash {
                 hasher.update(chunk);
             }
@@ -622,6 +667,16 @@ fn write_repeated_chunk(
     crc: &mut Crc32,
     hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
     byte: u8,
+    len: usize,
+) -> std::io::Result<()> {
+    write_repeated_chunk_with_optional_crc(writer, Some(crc), hash, byte, len)
+}
+
+fn write_repeated_chunk_with_optional_crc(
+    writer: &mut dyn Write,
+    mut crc: Option<&mut Crc32>,
+    hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
+    byte: u8,
     mut len: usize,
 ) -> std::io::Result<()> {
     let buffer = [byte; 64 * 1024];
@@ -629,10 +684,16 @@ fn write_repeated_chunk(
         let take = len.min(buffer.len());
         let chunk = &buffer[..take];
         writer.write_all(chunk)?;
-        if byte == 0 {
-            crc.update_zeroes(take as u64);
-        } else {
-            crc.update(chunk);
+        #[cfg(all(test, feature = "write"))]
+        streaming_checks_tests::record_repeated_output(take, byte == 0);
+        if let Some(crc) = crc.as_mut() {
+            #[cfg(all(test, feature = "write"))]
+            streaming_checks_tests::record_crc_work(take, byte == 0);
+            if byte == 0 {
+                crc.update_zeroes(take as u64);
+            } else {
+                crc.update(chunk);
+            }
         }
         if let Some((_, hasher)) = hash.as_mut() {
             hasher.update(chunk);
@@ -1119,7 +1180,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         let (mut packed, keys) = file
             .packed_reader_with_allowance(archive, self.password, &self.allowance)
             .map_err(|error| file.entry_error("reading", error))?;
-        file.stream_packed_with_decoder(
+        file.stream_packed_with_crc_policy::<true, _, _>(
             &mut packed,
             keys.as_ref(),
             &mut streaming_decoder,
