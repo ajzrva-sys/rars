@@ -977,10 +977,14 @@ mod tests {
         create_rar50_redirection(&dir, &meta, &redirection, OverwritePolicy::Always, &created)
             .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"payload");
-        let error =
-            prepare_redirection_destination(&destination.join("child"), OverwritePolicy::Always)
-                .unwrap_err();
-        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        // Windows can report NotFound for a child below a regular file. The
+        // redirection operation still has to reject that parent before writing.
+        meta.name = b"destination/child".to_vec();
+        assert!(matches!(
+            create_rar50_redirection(&dir, &meta, &redirection, OverwritePolicy::Always, &created),
+            Err(Error::Io(_))
+        ));
+        assert!(!destination.join("child").exists());
         assert_eq!(fs::read(&destination).unwrap(), b"payload");
     }
 
@@ -1409,17 +1413,24 @@ mod tests {
     /// character. Splitting on it invents a directory the archive never
     /// declared. RAR 1.5-4.x is the opposite and must keep splitting.
     ///
-    /// Matches RAR 7.12 on Unix: kept verbatim for a Unix-host entry, replaced
-    /// with `_` for a Windows-host one.
+    /// Unix keeps a Unix-host entry verbatim. Other platforms and Windows-host
+    /// entries map backslashes to `_`, without adding directory levels.
     #[test]
     fn rar50_backslash_is_a_character_and_legacy_backslash_is_a_separator() {
         const UNIX: u64 = 1;
         const WINDOWS: u64 = 0;
 
-        assert_eq!(
-            rar50_entry_name(br"sub\nam.t", UNIX),
-            br"sub\nam.t".to_vec()
-        );
+        let unix_host_name = if cfg!(unix) {
+            br"sub\nam.t".as_slice()
+        } else {
+            b"sub_nam.t".as_slice()
+        };
+        let unix_host_path = if cfg!(unix) {
+            std::path::Path::new(r"sub\nam.t")
+        } else {
+            std::path::Path::new("sub_nam.t")
+        };
+        assert_eq!(rar50_entry_name(br"sub\nam.t", UNIX), unix_host_name);
         assert_eq!(
             rar50_entry_name(br"sub\nam.t", WINDOWS),
             b"sub_nam.t".to_vec()
@@ -1427,7 +1438,7 @@ mod tests {
 
         assert_eq!(
             rar50_output_relative_path(br"sub\nam.t", UNIX).unwrap(),
-            std::path::Path::new(r"sub\nam.t")
+            unix_host_path
         );
         assert_eq!(
             rar50_output_relative_path(br"sub\nam.t", WINDOWS).unwrap(),
@@ -1445,17 +1456,27 @@ mod tests {
         );
     }
 
-    /// Keeping the backslash must not open a traversal: it stays inside one
-    /// path component, so the `..` check never sees a parent directory.
+    /// A literal or mapped backslash name stays within one component. Real
+    /// parent components must still be refused on every native platform.
     #[test]
     fn rar50_backslash_traversal_is_still_refused() {
         const UNIX: u64 = 1;
-        assert!(rar50_output_relative_path(br"..\..\pwn", UNIX).is_ok());
+        const WINDOWS: u64 = 0;
+        let mapped = rar50_output_relative_path(br"..\..\pwn", UNIX).unwrap();
         assert_eq!(
-            rar50_output_relative_path(br"..\..\pwn", UNIX).unwrap(),
-            std::path::Path::new(r"..\..\pwn")
+            mapped,
+            if cfg!(unix) {
+                std::path::Path::new(r"..\..\pwn")
+            } else {
+                std::path::Path::new(".._.._pwn")
+            }
         );
-        assert!(rar50_output_relative_path(b"../../pwn", UNIX).is_err());
+        assert_eq!(mapped.components().count(), 1);
+        for host in [UNIX, WINDOWS] {
+            for name in [b"../../pwn".as_slice(), br"../..\pwn", b"/pwn"] {
+                assert!(rar50_output_relative_path(name, host).is_err());
+            }
+        }
         assert!(output_relative_path(br"..\..\pwn").is_err());
     }
 
