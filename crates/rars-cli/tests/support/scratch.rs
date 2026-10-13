@@ -79,7 +79,7 @@ pub fn case(name: &str) -> Scratch {
 ///
 /// Integration tests and benchmarks get `CARGO_TARGET_TMPDIR` from cargo,
 /// which already follows `CARGO_TARGET_DIR`. Unit tests inside `src/` get no
-/// such variable, so they work the target directory out from the manifest.
+/// such variable, so they use the location of the running test executable.
 fn root() -> PathBuf {
     let path = match option_env!("CARGO_TARGET_TMPDIR") {
         Some(path) => PathBuf::from(path),
@@ -92,10 +92,22 @@ fn root() -> PathBuf {
 
 fn target_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        return PathBuf::from(dir);
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return dir.canonicalize().unwrap_or(dir);
+        }
     }
-    // Every crate here lives at <workspace>/crates/<crate>, and cargo puts the
-    // target directory at the workspace root.
+    // Cargo resolves relative target directories before changing to each
+    // crate's directory to run its tests. Resolve from the executable rather
+    // than interpreting that relative path a second time in the new cwd.
+    // This also follows target-dir settings in Cargo configuration files.
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(dir) = executable_target_dir(&executable) {
+            return dir;
+        }
+    }
+    // Fallback for runners that relocate test executables outside Cargo's
+    // profile/deps layout. Every crate lives at <workspace>/crates/<crate>.
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
@@ -127,5 +139,40 @@ pub fn supports_raw_byte_names(root: &Path) -> bool {
             false
         }
         Err(error) => panic!("raw filename probe failed unexpectedly: {error}"),
+    }
+}
+
+fn executable_target_dir(executable: &Path) -> Option<PathBuf> {
+    if !executable.is_absolute() {
+        return None;
+    }
+    let deps = executable.parent()?;
+    if deps.file_name()? != "deps" {
+        return None;
+    }
+    Some(deps.parent()?.parent()?.to_path_buf())
+}
+
+#[cfg(test)]
+mod target_directory_tests {
+    use super::*;
+
+    #[test]
+    fn test_executable_layouts_produce_absolute_scratch_roots() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("rars-scratch-layout-probe");
+        for profile in ["debug", "release", "custom-profile"] {
+            let executable = base.join(profile).join("deps").join("rars-tests");
+            assert_eq!(executable_target_dir(&executable), Some(base.clone()));
+        }
+        let cross_target = base.join("aarch64-apple-darwin");
+        assert_eq!(
+            executable_target_dir(&cross_target.join("debug/deps/rars-tests")),
+            Some(cross_target),
+        );
+        assert_eq!(
+            executable_target_dir(Path::new("target/debug/deps/test")),
+            None
+        );
+        assert_eq!(executable_target_dir(&base.join("relocated-tests")), None);
     }
 }
