@@ -102,8 +102,12 @@ fn configure_threads(threads: Option<usize>) -> CliResult<()> {
         .ok()
         .map(std::num::NonZeroUsize::get);
     let mut builder = rayon::ThreadPoolBuilder::new();
-    if let Some(threads) = threads.or(default_threads) {
+    let selected_threads = threads.or(default_threads);
+    if let Some(threads) = selected_threads {
         builder = builder.num_threads(threads);
+    }
+    if selected_threads == Some(1) {
+        builder = builder.use_current_thread();
     }
     builder
         .build_global()
@@ -2300,6 +2304,57 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_thread_workers_run_on_the_caller_and_drain_panicking_jobs() {
+        const CHILD: &str = "RARS_INLINE_POOL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::single_thread_workers_run_on_the_caller_and_drain_panicking_jobs",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fresh-process pool probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        super::configure_threads(Some(1)).unwrap();
+        assert_eq!(rayon::current_num_threads(), 1);
+        assert_eq!(rayon::current_thread_index(), Some(0));
+        let caller = std::thread::current().id();
+        let sum: usize = (0..128usize)
+            .into_par_iter()
+            .map(|value| {
+                assert_eq!(std::thread::current().id(), caller);
+                let (left, right) = rayon::join(|| value, || value + 1);
+                left + right
+            })
+            .sum();
+        assert_eq!(sum, (0..128usize).map(|value| 2 * value + 1).sum());
+
+        let sibling_finished = AtomicBool::new(false);
+        let panic = std::panic::catch_unwind(|| {
+            rayon::join(
+                || panic!("intentional synchronous worker failure"),
+                || sibling_finished.store(true, Ordering::SeqCst),
+            );
+        });
+        assert!(panic.is_err());
+        assert!(sibling_finished.load(Ordering::SeqCst));
+        assert_eq!((0..16usize).into_par_iter().sum::<usize>(), 120);
+    }
+
     #[cfg(unix)]
     #[test]
     fn volume_preflight_reports_parent_symlink_loops_and_cleans_staging() {
