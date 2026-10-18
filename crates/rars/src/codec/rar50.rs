@@ -17,7 +17,10 @@ pub(crate) use encoder::{
 };
 
 #[cfg(feature = "write")]
-pub(crate) use encoder::hybrid_encoder::{encode_partition, HybridCodecOptions, HybridCodecState};
+pub(crate) use encoder::hybrid_encoder::{
+    encode_partition_with_chain, hybrid_workspace_required, CommittedChain, HybridCodecOptions,
+    HybridCodecState, HybridMatchHint,
+};
 
 use super::filters::{self, DeltaErrorMessages};
 use super::workspace::{Allowance, Budget, Buffer};

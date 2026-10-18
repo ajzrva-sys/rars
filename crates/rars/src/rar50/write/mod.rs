@@ -13,7 +13,7 @@ mod compress;
 mod engine;
 mod filter_policy;
 pub(crate) mod headers;
-mod hybrid;
+pub(crate) mod hybrid;
 mod layout;
 mod plan;
 #[cfg(test)]
@@ -400,6 +400,7 @@ pub fn write_streaming_volumes_with_progress(
         )?;
         let dictionary =
             hybrid::select_dictionary(&captured, options, &extras.filter_policy, &resources)?;
+        resources.hybrid_analysis = captured.analysis.clone();
         let mut selected = options.with_dictionary_size(dictionary);
         selected.hybrid = None;
         if hybrid_options.architecture == crate::HybridArchitecture::Relationships {
@@ -576,6 +577,7 @@ pub(crate) fn write_streaming_archive_reporting(
         let captured = hybrid::capture(entries, hybrid_options, &resources, progress)?;
         let dictionary =
             hybrid::select_dictionary(&captured, options, &extras.filter_policy, &resources)?;
+        resources.hybrid_analysis = captured.analysis.clone();
         let mut selected = options.with_dictionary_size(dictionary);
         selected.hybrid = None;
         if hybrid_options.architecture == crate::HybridArchitecture::Relationships {

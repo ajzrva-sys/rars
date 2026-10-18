@@ -374,30 +374,26 @@ fn cache_projection_is_explicit_and_retains_nearest_prefix_and_longest() {
         let at = start - (index + 1) * 256;
         data[at..at + length].copy_from_slice(&payload[..length]);
     }
-    let options = EncodeOptions::new(64).with_max_match_distance(start);
     let control = ReadControl::default();
+    let domain = make_domain(&data[start..], 0, &[], None, &budget, &control, &|| false).unwrap();
     let mut work = HybridWork::default();
-    let mut collector = collector_with_control(
-        &data,
+    let evidence = shared_evidence(
+        &data[..start],
+        &domain,
         start,
-        options,
+        HybridCodecOptions {
+            max_match_candidates: 64,
+            ..small()
+        },
+        &[],
         &budget,
         &control,
         &|| false,
         &mut work,
     )
     .unwrap();
-    let (matches, truncated) = collector
-        .collect_hybrid(
-            &data,
-            start..start + span,
-            options,
-            &control,
-            &|| false,
-            16,
-            &mut work,
-        )
-        .unwrap();
+    let matches = &evidence.matches;
+    let truncated = evidence.quality.truncated;
     assert!(truncated);
     let first = &matches.runs[matches.starts[0] as usize..matches.starts[1] as usize];
     assert_eq!(first.len(), 16);
@@ -407,7 +403,7 @@ fn cache_projection_is_explicit_and_retains_nearest_prefix_and_longest() {
         .windows(2)
         .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1));
     assert!(work.chain_candidates >= 40);
-    assert_eq!(work.seeded_positions, start as u64);
+    assert_eq!(work.seeded_positions, (start - 3) as u64);
 }
 
 #[test]
@@ -553,7 +549,8 @@ fn server_tail_partition_dedup_includes_nonadjacent_shapes() {
     assert!(output
         .cache_quality
         .iter()
-        .all(|q| q.run_cap == 64 && q.nearest_prefix_then_longest && !q.every_position));
+        .all(|q| q.nearest_prefix_then_longest
+            && ((q.run_cap == 64 && q.every_position) || q.run_cap == 0)));
     unpack(&output.bytes, &data, 0, 4096);
 }
 
@@ -657,4 +654,290 @@ fn empty_decision_has_a_complete_fresh_table_block_and_empty_state() {
         assert!(output.end_state.history().is_empty());
         unpack(&output.bytes, &[], version, 4096);
     }
+}
+
+#[test]
+fn exact_diagonal_cache_reuses_a_long_run_and_distinguishes_limits_from_mismatch() {
+    let budget = Allowance::default();
+    let mut bytes = vec![b'x'; 20_001];
+    bytes[20_000] = b'y';
+    let mut equality = EqualityCache::new(&budget).unwrap();
+    for pos in 1..20_000 {
+        let limit = (bytes.len() - pos).min(MAX_ENCODER_MATCH_LENGTH);
+        let expected = (20_000 - pos).min(limit);
+        assert_eq!(equality.length(&bytes, pos, 1, limit), expected);
+    }
+    assert!(
+        equality.compared <= bytes.len() as u64 + 1,
+        "{} byte comparisons",
+        equality.compared
+    );
+    assert_eq!(equality.length(&bytes, 19_999, 1, 1), 1);
+    assert_eq!(equality.length(&bytes, 19_999, 1, 2), 1);
+    assert_eq!(equality.length(&bytes, 20_000, 1, 1), 0);
+    assert_eq!(equality.length(&bytes, 0, 1, 1), 0);
+    assert_eq!(equality.length(&bytes, 1, 0, 1), 0);
+}
+
+#[test]
+fn exact_diagonal_cache_is_local_to_the_actual_byte_representation() {
+    let budget = Allowance::default();
+    let raw = b"aaaaaaaaaaaa";
+    let transformed = b"abababababab";
+    let mut first = EqualityCache::new(&budget).unwrap();
+    let mut second = EqualityCache::new(&budget).unwrap();
+    assert_eq!(first.length(raw, 1, 1, 11), 11);
+    assert_eq!(second.length(transformed, 1, 1, 11), 0);
+    assert_eq!(second.length(transformed, 2, 2, 10), 10);
+    // Direct-map replacement is harmless exact recomputation.
+    assert_eq!(second.length(transformed, 3, 1, 9), 0);
+}
+
+#[test]
+fn all_origin_tape_repairs_nice_skips_once_and_partitions_share_it() {
+    let budget = Allowance::default();
+    let control = ReadControl::default();
+    let history = vec![b'A'; 512];
+    let data = vec![b'A'; 65537];
+    let domain = make_domain(&data, 0, &[], None, &budget, &control, &|| false).unwrap();
+    let mut work = HybridWork::default();
+    let mut evidence = shared_evidence(
+        &history,
+        &domain,
+        4096,
+        small(),
+        &[],
+        &budget,
+        &control,
+        &|| false,
+        &mut work,
+    )
+    .unwrap();
+    assert!(evidence.quality.every_position);
+    for offset in 0..data.len() - 3 {
+        let run = &evidence.matches.runs[evidence.matches.starts[offset] as usize
+            ..evidence.matches.starts[offset + 1] as usize];
+        assert!(
+            !run.is_empty(),
+            "origin {offset} was treated as unknown/match-free"
+        );
+    }
+    for partition in 0..3 {
+        let _ = plan_domain(
+            &domain,
+            &mut evidence,
+            EncoderMatchState::default(),
+            0,
+            partition,
+            small(),
+            true,
+            true,
+            &budget,
+            &control,
+            &|| false,
+            &mut work,
+        )
+        .unwrap();
+    }
+    assert_eq!(work.cache_builds, 1);
+    assert_eq!(work.seeded_positions, (history.len() - 3) as u64);
+    assert!(evidence.equality.compared < 2 * data.len() as u64);
+}
+
+#[test]
+fn invalid_or_filter_incompatible_index_hints_cannot_authorize_matches() {
+    let budget = Allowance::default();
+    let control = ReadControl::default();
+    let data = b"these bytes do not repeat a four byte substring";
+    let state = HybridCodecState::new(&[], 4096, 0, &budget).unwrap();
+    let hints = [
+        HybridMatchHint {
+            offset: 0,
+            distance: 1,
+            maxlen: 4096,
+        },
+        HybridMatchHint {
+            offset: 7,
+            distance: 7,
+            maxlen: 4096,
+        },
+        HybridMatchHint {
+            offset: 8,
+            distance: usize::MAX,
+            maxlen: usize::MAX,
+        },
+    ];
+    let output = encode_partition_with_hints(
+        data,
+        &[],
+        &state,
+        small(),
+        &[],
+        &hints,
+        true,
+        &budget,
+        &control,
+        &|| false,
+        None,
+    )
+    .unwrap();
+    unpack(&output.bytes, data, 0, 4096);
+    assert_eq!(output.work.hint_matches, 0);
+}
+
+#[test]
+fn protected_strategy_preserves_the_ordinary_chain_choices() {
+    let budget = Allowance::default();
+    let control = ReadControl::default();
+    let history = b"ABCDEFGHABCDEFGH other history".repeat(20);
+    let data = [
+        b"ABCDEFGH".repeat(75),
+        b"prefix novel and copied again\n".repeat(20),
+        vec![b'x'; 700],
+    ]
+    .concat();
+    let domain = make_domain(&data, 0, &[], None, &budget, &control, &|| false).unwrap();
+    let chain =
+        CommittedChain::new_from_history(&history, 4096, history.len() as u64, &budget).unwrap();
+    for version in [0, 1] {
+        let mut work = HybridWork::default();
+        let mut evidence = shared_evidence_with_chain(
+            &history,
+            &domain,
+            4096,
+            &chain,
+            history.len() as u64,
+            small(),
+            &[],
+            &budget,
+            &control,
+            &|| false,
+            &mut work,
+        )
+        .unwrap();
+        let options = EncodeOptions::new(16).with_max_match_distance(4096);
+        let initial = EncoderMatchState {
+            reps: [8, 16, 0, 0],
+            last_length: 8,
+        };
+        let size = distance_size(version).unwrap();
+        let actual = protected_tokens(
+            &mut evidence,
+            initial,
+            &chain,
+            history.len() as u64,
+            options,
+            size,
+            &budget,
+            &control,
+            &|| false,
+            &mut work,
+        )
+        .unwrap();
+        let combined = &evidence.combined;
+        let mut finder =
+            Rar50MatchFinder::with_allowance(finder_window(options, combined.len()), &budget)
+                .unwrap();
+        for pos in 0..history.len() {
+            finder.insert(combined, pos);
+        }
+        let mut expected = Vec::new();
+        let mut pos = history.len();
+        let mut state = initial;
+        while pos < combined.len() {
+            let length = if let Some(found) = best_match(
+                combined,
+                pos,
+                combined.len(),
+                &finder,
+                options,
+                &state,
+                size,
+            ) {
+                expected.push(EncodeToken::Match {
+                    length: found.length,
+                    distance: found.distance,
+                });
+                state.remember(found.length, found.distance);
+                found.length
+            } else {
+                expected.push(EncodeToken::Literal(combined[pos]));
+                1
+            };
+            for at in pos..pos + length {
+                finder.insert(combined, at);
+            }
+            pos += length;
+        }
+        assert_eq!(&*actual, &expected);
+    }
+}
+
+#[test]
+fn persistent_chain_commits_only_successful_winners_and_never_reseeds_the_next_window() {
+    let budget = Allowance::default();
+    let control = ReadControl::default();
+    let data: Vec<_> = (0..HYBRID_WINDOW).map(|at| (at % 53) as u8).collect();
+    let next = data[..257].to_vec();
+    let state = HybridCodecState::new(&[], 4096, 0, &budget).unwrap();
+    let mut chain = CommittedChain::new_from_history(&[], 4096, 0, &budget).unwrap();
+    let config = HybridCodecOptions {
+        beam_width: 1,
+        ..small()
+    };
+    assert!(matches!(
+        encode_partition_with_chain(
+            &data,
+            &next,
+            &state,
+            config,
+            &[],
+            &[],
+            &mut chain,
+            false,
+            &budget,
+            &control,
+            &|| false,
+            Some(&mut |_| false)
+        ),
+        Err(Error::Cancelled)
+    ));
+    // Reusing the same base after callback refusal proves no speculative commit.
+    let first = encode_partition_with_chain(
+        &data,
+        &next,
+        &state,
+        config,
+        &[],
+        &[],
+        &mut chain,
+        false,
+        &budget,
+        &control,
+        &|| false,
+        None,
+    )
+    .unwrap();
+    let second = encode_partition_with_chain(
+        &next,
+        &[],
+        &first.end_state,
+        config,
+        &[],
+        &[],
+        &mut chain,
+        true,
+        &budget,
+        &control,
+        &|| false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(first.work.seeded_positions, 0);
+    assert_eq!(second.work.seeded_positions, 0);
+    assert_eq!(second.work.cache_builds, 1);
+    assert!(second.work.overlay_positions <= 2 * (next.len() as u64 + 3));
+    let encoded = [&*first.bytes, &*second.bytes].concat();
+    let expected = [data, next].concat();
+    unpack(&encoded, &expected, 0, 4096);
 }

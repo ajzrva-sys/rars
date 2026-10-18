@@ -8,7 +8,7 @@
 mod index;
 mod options;
 
-pub use index::{IndexLimits, Occurrence, RepeatIndex};
+pub use index::{IndexLimits, Occurrence, QueryBudget, QueryResult, RepeatIndex};
 pub use options::{
     choose_minimax, dictionary_shortlist, DictionaryMeasurement, DictionaryStats,
     HybridArchitecture, HybridOptions, HybridProfile,

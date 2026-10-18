@@ -1,19 +1,27 @@
 use super::DictionaryStats;
+#[path = "query.rs"]
+mod query;
 use crate::streaming::StorageCharge;
 #[cfg(any(test, feature = "write"))]
 use crate::WriterResources;
 use crate::{EntrySource, Error, Result};
+pub use query::{QueryBudget, QueryResult};
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(not(unix))]
+use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const NONE: u64 = u64::MAX;
-const PAGE: usize = 4096;
+pub(crate) const RECORD_FLUSH_SCRATCH_BYTES: usize = 4096;
+const PAGE: usize = RECORD_FLUSH_SCRATCH_BYTES;
 const RECORD_BYTES: usize = 88;
+const DIRTY: u64 = 1 << 63;
+const ID_MASK: u64 = !DIRTY;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 fn private_file(path: &Path) -> std::io::Result<File> {
@@ -44,6 +52,7 @@ struct Storage {
     // Sources and open range readers retain this same owner. No reservation
     // is released just because the tree/cache or capture coordinator is gone.
     charge: Mutex<Option<StorageCharge>>,
+    io_failed: Arc<AtomicBool>,
 }
 
 impl Drop for Storage {
@@ -186,11 +195,68 @@ struct Slot<T: Record> {
     value: T,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct IoCounts {
+    reads: u64,
+    writes: u64,
+    written_bytes: u64,
+}
+
+// The Unix implementation never changes the shared file cursor. Other targets
+// retain the single-owner seek/read/write fallback.
+fn read_at(file: &mut File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.read_exact_at(bytes, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(bytes)
+    }
+}
+
+fn write_at(file: &mut File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.write_all_at(bytes, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(bytes)
+    }
+}
+
+fn store_healthy(failed: &AtomicBool) -> Result<()> {
+    if failed.load(Ordering::Relaxed) {
+        Err(Error::WriterFailure(
+            "hybrid index backing store previously failed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn store_result<T>(failed: &AtomicBool, result: std::io::Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        failed.store(true, Ordering::Relaxed);
+        error.into()
+    })
+}
+
 struct Records<T: Record> {
     file: File,
     length: u64,
-    // Direct mapped and write-through: no unbounded hash/LRU auxiliary storage.
+    // Preserve dense direct-mapped residency. The unused high ID bit marks a
+    // dirty value; NONE remains the unique invalid tag.
     cache: Vec<Slot<T>>,
+    failed: Arc<AtomicBool>,
+    #[cfg(test)]
+    io: IoCounts,
+    #[cfg(test)]
+    fail_write_after: Option<usize>,
 }
 
 fn memory_error(limit: u64, required: u64) -> Error {
@@ -202,7 +268,7 @@ fn memory_error(limit: u64, required: u64) -> Error {
 }
 
 impl<T: Record> Records<T> {
-    fn create(path: &Path, cache_bytes: u64) -> Result<Self> {
+    fn create(path: &Path, cache_bytes: u64, failed: Arc<AtomicBool>) -> Result<Self> {
         let count = usize::try_from(cache_bytes / std::mem::size_of::<Slot<T>>() as u64)
             .map_err(|_| memory_error(cache_bytes, u64::MAX))?;
         let mut cache = Vec::new();
@@ -220,55 +286,159 @@ impl<T: Record> Records<T> {
             file: private_file(path)?,
             length: 0,
             cache,
+            failed,
+            #[cfg(test)]
+            io: IoCounts::default(),
+            #[cfg(test)]
+            fail_write_after: None,
         })
     }
     fn allocated(&self) -> u64 {
         (self.cache.capacity() * std::mem::size_of::<Slot<T>>()) as u64
     }
+    fn offset(id: u64) -> Result<u64> {
+        let offset = id.checked_mul(T::WIDTH as u64);
+        if id & DIRTY != 0
+            || offset
+                .and_then(|start| start.checked_add(T::WIDTH as u64))
+                .is_none()
+        {
+            return Err(Error::WriterFailure("hybrid index record offset overflows"));
+        }
+        Ok(offset.expect("checked record offset"))
+    }
+    fn dirty(tag: u64) -> bool {
+        tag != NONE && tag & DIRTY != 0
+    }
+    fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(Error::WriterFailure("hybrid index record end overflows"))?;
+        #[cfg(test)]
+        {
+            self.io.writes += 1;
+            self.io.written_bytes += bytes.len() as u64;
+        }
+        #[cfg(test)]
+        if let Some(prefix) = self.fail_write_after.take() {
+            store_result(
+                &self.failed,
+                write_at(&mut self.file, &bytes[..prefix], offset),
+            )?;
+            return store_result(
+                &self.failed,
+                Err(std::io::Error::other("injected partial write")),
+            );
+        }
+        store_result(&self.failed, write_at(&mut self.file, bytes, offset))
+    }
+    fn flush_id(&mut self, id: u64) -> Result<()> {
+        store_healthy(&self.failed)?;
+        let per_group = PAGE / T::WIDTH;
+        let first = id / per_group as u64 * per_group as u64;
+        let mut bytes = [0u8; PAGE];
+        let mut next = 0;
+        while next < per_group {
+            let record = first + next as u64;
+            let slot = &self.cache[record as usize % self.cache.len()];
+            if slot.id != (record | DIRTY) {
+                next += 1;
+                continue;
+            }
+            let start = next;
+            while next < per_group {
+                let record = first + next as u64;
+                let slot = &self.cache[record as usize % self.cache.len()];
+                if slot.id != (record | DIRTY) {
+                    break;
+                }
+                let at = (next - start) * T::WIDTH;
+                slot.value.encode(&mut bytes[at..at + T::WIDTH]);
+                next += 1;
+            }
+            let count = next - start;
+            self.write(
+                Self::offset(first + start as u64)?,
+                &bytes[..count * T::WIDTH],
+            )?;
+            // A partial/failed write above leaves all of this run dirty. No
+            // cache lookup, insertion or eviction takes place while gathering.
+            for within in start..next {
+                let record = first + within as u64;
+                let at = record as usize % self.cache.len();
+                self.cache[at].id &= ID_MASK;
+            }
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<()> {
+        store_healthy(&self.failed)?;
+        for at in 0..self.cache.len() {
+            if Self::dirty(self.cache[at].id) {
+                self.flush_id(self.cache[at].id & ID_MASK)?;
+            }
+        }
+        Ok(())
+    }
     fn get(&mut self, id: u64) -> Result<T> {
+        store_healthy(&self.failed)?;
         if id >= self.length {
             return Err(Error::WriterFailure("hybrid index record is missing"));
         }
+        let offset = Self::offset(id)?;
         if !self.cache.is_empty() {
-            let slot = &self.cache[id as usize % self.cache.len()];
-            if slot.id == id {
+            let at = id as usize % self.cache.len();
+            let slot = &self.cache[at];
+            if slot.id != NONE && slot.id & ID_MASK == id {
                 return Ok(slot.value);
+            }
+            if Self::dirty(slot.id) {
+                self.flush_id(slot.id & ID_MASK)?;
             }
         }
         let mut bytes = [0u8; RECORD_BYTES];
-        self.file
-            .seek(SeekFrom::Start(id.checked_mul(T::WIDTH as u64).ok_or(
-                Error::WriterFailure("hybrid index record offset overflows"),
-            )?))?;
-        self.file.read_exact(&mut bytes[..T::WIDTH])?;
+        #[cfg(test)]
+        {
+            self.io.reads += 1;
+        }
+        store_result(
+            &self.failed,
+            read_at(&mut self.file, &mut bytes[..T::WIDTH], offset),
+        )?;
         let value = T::decode(&bytes[..T::WIDTH]);
-        self.cache_value(id, value);
-        Ok(value)
-    }
-    fn cache_value(&mut self, id: u64, value: T) {
         if !self.cache.is_empty() {
             let at = id as usize % self.cache.len();
             self.cache[at] = Slot { id, value };
         }
+        Ok(value)
     }
     fn put(&mut self, id: u64, value: T) -> Result<()> {
-        let mut bytes = [0u8; RECORD_BYTES];
-        value.encode(&mut bytes[..T::WIDTH]);
-        self.file
-            .seek(SeekFrom::Start(id.checked_mul(T::WIDTH as u64).ok_or(
-                Error::WriterFailure("hybrid index record offset overflows"),
-            )?))?;
-        self.file.write_all(&bytes[..T::WIDTH])?;
-        self.cache_value(id, value);
+        store_healthy(&self.failed)?;
+        let offset = Self::offset(id)?;
+        if self.cache.is_empty() {
+            let mut bytes = [0u8; RECORD_BYTES];
+            value.encode(&mut bytes[..T::WIDTH]);
+            return self.write(offset, &bytes[..T::WIDTH]);
+        }
+        let at = id as usize % self.cache.len();
+        let tag = self.cache[at].id;
+        if tag != NONE && tag & ID_MASK != id && Self::dirty(tag) {
+            self.flush_id(tag & ID_MASK)?;
+        }
+        self.cache[at] = Slot {
+            id: id | DIRTY,
+            value,
+        };
         Ok(())
     }
     fn append(&mut self, value: T) -> Result<u64> {
         let id = self.length;
-        self.put(id, value)?;
-        self.length = self
-            .length
+        let end = id
             .checked_add(1)
             .ok_or(Error::WriterFailure("hybrid index record count overflows"))?;
+        // Caller admits logical disk growth before publication in this store.
+        self.put(id, value)?;
+        self.length = end;
         Ok(id)
     }
 }
@@ -282,10 +452,13 @@ struct Bytes {
     file: File,
     length: u64,
     cache: Vec<BytePage>,
+    failed: Arc<AtomicBool>,
+    #[cfg(test)]
+    io: IoCounts,
 }
 
 impl Bytes {
-    fn create(path: &Path, budget: u64) -> Result<Self> {
+    fn create(path: &Path, budget: u64, failed: Arc<AtomicBool>) -> Result<Self> {
         let count = usize::try_from(budget / std::mem::size_of::<BytePage>() as u64)
             .map_err(|_| memory_error(budget, u64::MAX))?;
         let mut cache = Vec::new();
@@ -301,20 +474,29 @@ impl Bytes {
             file: private_file(path)?,
             length: 0,
             cache,
+            failed,
+            #[cfg(test)]
+            io: IoCounts::default(),
         })
     }
     fn allocated(&self) -> u64 {
         (self.cache.capacity() * std::mem::size_of::<BytePage>()) as u64
     }
     fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        self.file.seek(SeekFrom::Start(self.length))?;
-        self.file.write_all(bytes)?;
-        self.length = self
+        store_healthy(&self.failed)?;
+        let end = self
             .length
             .checked_add(bytes.len() as u64)
             .ok_or(Error::WriterFailure(
                 "hybrid captured input offset overflows",
             ))?;
+        #[cfg(test)]
+        {
+            self.io.writes += 1;
+            self.io.written_bytes += bytes.len() as u64;
+        }
+        store_result(&self.failed, write_at(&mut self.file, bytes, self.length))?;
+        self.length = end;
         // Existing full pages remain immutable; only an old partial tail can change.
         if !bytes.is_empty() && !self.cache.is_empty() {
             let old = self.length - bytes.len() as u64;
@@ -327,13 +509,17 @@ impl Bytes {
         Ok(())
     }
     fn get(&mut self, offset: u64) -> Result<u8> {
+        store_healthy(&self.failed)?;
         if offset >= self.length {
             return Err(Error::WriterFailure("hybrid captured byte is missing"));
         }
         if self.cache.is_empty() {
             let mut byte = [0u8; 1];
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.read_exact(&mut byte)?;
+            #[cfg(test)]
+            {
+                self.io.reads += 1;
+            }
+            store_result(&self.failed, read_at(&mut self.file, &mut byte, offset))?;
             return Ok(byte[0]);
         }
         let id = offset / PAGE as u64;
@@ -342,8 +528,14 @@ impl Bytes {
         if page.id != id {
             let start = id * PAGE as u64;
             page.valid = (self.length - start).min(PAGE as u64) as usize;
-            self.file.seek(SeekFrom::Start(start))?;
-            self.file.read_exact(&mut page.bytes[..page.valid])?;
+            #[cfg(test)]
+            {
+                self.io.reads += 1;
+            }
+            store_result(
+                &self.failed,
+                read_at(&mut self.file, &mut page.bytes[..page.valid], start),
+            )?;
             page.id = id;
         }
         let within = offset as usize % PAGE;
@@ -360,7 +552,8 @@ impl Bytes {
 /// Finished member leaf ends are shared through their member record, avoiding a
 /// leaf rewrite pass. Byte children have at most 256 entries; unique terminator
 /// children have a separate list and are never scanned during byte lookup.
-/// All mutations are write-through. An I/O/quota failure poisons construction,
+/// Node/member mutations use a bounded write-back cache; captured bytes are
+/// written immediately. An I/O/quota failure poisons construction,
 /// so an incomplete tree can never be returned as a complete query result.
 pub struct RepeatIndex {
     nodes: Records<Node>,
@@ -425,17 +618,27 @@ impl RepeatIndex {
                     break Arc::new(Storage {
                         directory: path,
                         charge: Mutex::new(charge.take()),
+                        io_failed: Arc::new(AtomicBool::new(false)),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
             }
         };
-        let nodes = Records::create(&storage.directory.join("nodes"), limits.cache_bytes / 2)?;
-        let members = Records::create(&storage.directory.join("members"), limits.cache_bytes / 8)?;
+        let nodes = Records::create(
+            &storage.directory.join("nodes"),
+            limits.cache_bytes / 2,
+            storage.io_failed.clone(),
+        )?;
+        let members = Records::create(
+            &storage.directory.join("members"),
+            limits.cache_bytes / 8,
+            storage.io_failed.clone(),
+        )?;
         let bytes = Bytes::create(
             &storage.directory.join("captured"),
             limits.cache_bytes - limits.cache_bytes / 2 - limits.cache_bytes / 8,
+            storage.io_failed.clone(),
         )?;
         let mut index = Self {
             nodes,
@@ -489,6 +692,7 @@ impl RepeatIndex {
     }
 
     fn healthy(&self) -> Result<()> {
+        store_healthy(&self.storage.io_failed)?;
         if self.failed {
             Err(Error::WriterFailure(
                 "hybrid index construction previously failed",
@@ -613,12 +817,29 @@ impl RepeatIndex {
                 "hybrid terminator left implicit suffixes",
             ));
         }
+        // These are error-reporting barriers, not crash-durability barriers.
+        // Publish completion only after all admitted record writes succeeded.
+        self.nodes.flush()?;
+        self.members.flush()?;
         self.active_member = None;
         self.active_node = 0;
         self.active_length = 0;
         self.active_edge = 0;
         self.failed = false;
         Ok(())
+    }
+
+    /// Flush all backing records before handing a completed index to consumers.
+    /// This does not request fsync or promise recovery after a process crash.
+    pub fn seal(&mut self) -> Result<()> {
+        self.healthy()?;
+        if self.active_member.is_some() {
+            return Err(Error::InvalidArgument(
+                "finish the hybrid member before sealing",
+            ));
+        }
+        self.nodes.flush()?;
+        self.members.flush()
     }
 
     fn member_at_text(&mut self, pos: u64) -> Result<(u64, Member)> {
@@ -1077,3 +1298,7 @@ impl Seek for CapturedReader {
         Ok(position)
     }
 }
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod cache_tests;

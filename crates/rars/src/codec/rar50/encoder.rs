@@ -391,24 +391,37 @@ fn encode_compressed_block_with_allowance<B: Budget>(
     is_last: bool,
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
-    if payload_bits > payload.len() * 8 {
-        return Err(Error::InvalidData("RAR 5 block bit count exceeds payload"));
-    }
-    if !payload.is_empty() && payload_bits <= (payload.len() - 1) * 8 {
-        return Err(Error::InvalidData("RAR 5 block has unused payload bytes"));
-    }
-    if payload.len() > 0x00ff_ffff {
+    let (header, header_len) =
+        compressed_block_header(payload.len(), payload_bits, has_tables, is_last)?;
+    // Planning and emission use the same header grammar, including the size
+    // width boundary and the final byte's exact number of significant bits.
+    Buffer::from_slices(&[&header[..header_len], payload], allowance)
+}
+
+fn compressed_block_header(
+    payload_len: usize,
+    payload_bits: usize,
+    has_tables: bool,
+    is_last: bool,
+) -> Result<([u8; 5], usize)> {
+    if payload_len > 0x00ff_ffff {
         return Err(Error::InvalidData("RAR 5 block payload is too large"));
     }
+    if payload_bits > payload_len * 8 {
+        return Err(Error::InvalidData("RAR 5 block bit count exceeds payload"));
+    }
+    if payload_len != 0 && payload_bits <= (payload_len - 1) * 8 {
+        return Err(Error::InvalidData("RAR 5 block has unused payload bytes"));
+    }
 
-    let size_len = if payload.len() <= 0xff {
+    let size_len = if payload_len <= 0xff {
         1
-    } else if payload.len() <= 0xffff {
+    } else if payload_len <= 0xffff {
         2
     } else {
         3
     };
-    let final_byte_bits = if payload.is_empty() {
+    let final_byte_bits = if payload_len == 0 {
         1
     } else {
         ((payload_bits - 1) % 8) + 1
@@ -423,7 +436,7 @@ fn encode_compressed_block_with_allowance<B: Budget>(
     }
 
     let mut size_bytes = [0u8; 3];
-    let mut size = payload.len();
+    let mut size = payload_len;
     for byte in &mut size_bytes[..size_len] {
         *byte = size as u8;
         size >>= 8;
@@ -431,11 +444,10 @@ fn encode_compressed_block_with_allowance<B: Budget>(
     let checksum = size_bytes[..size_len]
         .iter()
         .fold(0x5a ^ flags, |acc, &byte| acc ^ byte);
-    // The header and bounded payload have an exact final size.
-    Buffer::from_slices(
-        &[&[flags, checksum], &size_bytes[..size_len], payload],
-        allowance,
-    )
+    let mut header = [0; 5];
+    header[..2].copy_from_slice(&[flags, checksum]);
+    header[2..2 + size_len].copy_from_slice(&size_bytes[..size_len]);
+    Ok((header, 2 + size_len))
 }
 
 pub fn encode_literal_only(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>> {
@@ -1629,15 +1641,128 @@ fn encode_token_block_with_state<B: Budget>(
     initial: EncoderMatchState,
 ) -> Result<(Buffer<u8, B>, EncoderMatchState)> {
     let lengths = table_lengths_with_state(tokens, &[], distance_size, allowance, initial)?;
-
-    let main_table = EncoderCodeTable::from_lengths(&lengths.main, allowance)?;
-    let distance_table = EncoderCodeTable::from_lengths(&lengths.distance, allowance)?;
-    let align_table = EncoderCodeTable::from_lengths(&lengths.align, allowance)?;
-    let length_table = EncoderCodeTable::from_lengths(&lengths.length, allowance)?;
     let (table_data, table_bits) =
         encode_table_slices(lengths.slices(), algorithm_version, allowance)?;
     let payload_bits =
         token_stream_bits_with_state(tokens, &[], &lengths, distance_size, table_bits, initial)?;
+    let (payload, state) = write_token_payload(
+        tokens,
+        &[],
+        &lengths,
+        distance_size,
+        table_data,
+        table_bits,
+        payload_bits,
+        initial,
+        allowance,
+    )?;
+    let packed =
+        encode_compressed_block_with_allowance(&payload, payload_bits, true, is_last, allowance)?;
+    Ok((packed, state))
+}
+
+/// A fully priced, immutable compressed block. Only its small table metadata
+/// is serialized during planning; candidate payloads remain tokens until the
+/// selected complete partition is emitted.
+struct BlockPlan<B: Budget> {
+    tokens: Buffer<EncodeToken, B>,
+    filters: Buffer<EncodeFilter, B>,
+    initial: EncoderMatchState,
+    ending: EncoderMatchState,
+    lengths: OwnedLengths<B>,
+    table_data: Buffer<u8, B>,
+    table_bits: usize,
+    payload_bits: usize,
+    distance_size: usize,
+    header: [u8; 5],
+    header_len: usize,
+}
+
+impl<B: Budget> BlockPlan<B> {
+    fn len(&self) -> usize {
+        self.header_len + self.payload_bits.div_ceil(8)
+    }
+
+    fn state(&self) -> EncoderMatchState {
+        self.ending
+    }
+
+    fn lengths(&self) -> LengthSlices<'_> {
+        self.lengths.slices()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_token_block_with_state<B: Budget>(
+    tokens: Buffer<EncodeToken, B>,
+    filters: &[EncodeFilter],
+    algorithm_version: u8,
+    distance_size: usize,
+    is_last: bool,
+    allowance: &B,
+    initial: EncoderMatchState,
+) -> Result<BlockPlan<B>> {
+    let lengths = table_lengths_with_state(&tokens, filters, distance_size, allowance, initial)?;
+    let (table_data, table_bits) =
+        encode_table_slices(lengths.slices(), algorithm_version, allowance)?;
+    let (payload_bits, ending) = token_stream_cost_with_state(
+        &tokens,
+        filters,
+        &lengths,
+        distance_size,
+        table_bits,
+        initial,
+    )?;
+    let (header, header_len) =
+        compressed_block_header(payload_bits.div_ceil(8), payload_bits, true, is_last)?;
+    Ok(BlockPlan {
+        tokens,
+        filters: Buffer::copied(filters, allowance)?,
+        initial,
+        ending,
+        lengths,
+        table_data,
+        table_bits,
+        payload_bits,
+        distance_size,
+        header,
+        header_len,
+    })
+}
+
+fn emit_token_block_plan<B: Budget>(plan: &BlockPlan<B>) -> Result<Buffer<u8, B>> {
+    let allowance = plan.table_data.allowance();
+    let (payload, ending) = write_token_payload(
+        &plan.tokens,
+        &plan.filters,
+        &plan.lengths,
+        plan.distance_size,
+        Buffer::copied(&plan.table_data, &allowance)?,
+        plan.table_bits,
+        plan.payload_bits,
+        plan.initial,
+        &allowance,
+    )?;
+    debug_assert_eq!(ending, plan.ending);
+    Buffer::from_slices(&[&plan.header[..plan.header_len], &payload], &allowance)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_token_payload<B: Budget>(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    lengths: &OwnedLengths<B>,
+    distance_size: usize,
+    table_data: Buffer<u8, B>,
+    table_bits: usize,
+    payload_bits: usize,
+    initial: EncoderMatchState,
+    allowance: &B,
+) -> Result<(Buffer<u8, B>, EncoderMatchState)> {
+    let main_table = EncoderCodeTable::from_lengths(&lengths.main, allowance)?;
+    let distance_table = EncoderCodeTable::from_lengths(&lengths.distance, allowance)?;
+    let align_table = EncoderCodeTable::from_lengths(&lengths.align, allowance)?;
+    let length_table = EncoderCodeTable::from_lengths(&lengths.length, allowance)?;
     let mut writer = BitWriter {
         bytes: table_data,
         bit_pos: table_bits,
@@ -1646,7 +1771,12 @@ fn encode_token_block_with_state<B: Budget>(
         .bytes
         .reserve_total_capacity(payload_bits.div_ceil(8))?;
     let mut state = initial;
-    for &token in tokens {
+    for token in filters
+        .iter()
+        .copied()
+        .map(EncodeToken::Filter)
+        .chain(tokens.iter().copied())
+    {
         match token {
             EncodeToken::Filter(filter) => {
                 let (code, len) = main_table.code_for_present_symbol(256);
@@ -1717,14 +1847,7 @@ fn encode_token_block_with_state<B: Budget>(
     }
 
     debug_assert_eq!(writer.bit_pos, payload_bits);
-    let packed = encode_compressed_block_with_allowance(
-        &writer.bytes,
-        payload_bits,
-        true,
-        is_last,
-        allowance,
-    )?;
-    Ok((packed, state))
+    Ok((writer.bytes, state))
 }
 
 #[derive(Debug)]
@@ -1871,7 +1994,7 @@ pub(crate) struct EncodeFilter {
     channels: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct EncoderMatchState {
     reps: [usize; 4],
     last_length: usize,
@@ -2113,10 +2236,21 @@ fn token_stream_bits_with_state<B: Budget>(
     filters: &[EncodeFilter],
     lengths: &OwnedLengths<B>,
     distance_size: usize,
-    mut bits: usize,
+    bits: usize,
     initial: EncoderMatchState,
 ) -> Result<usize> {
-    let allowance = lengths.main.allowance();
+    token_stream_cost_with_state(tokens, filters, lengths, distance_size, bits, initial)
+        .map(|(bits, _)| bits)
+}
+
+fn token_stream_cost_with_state<B: Budget>(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    lengths: &OwnedLengths<B>,
+    distance_size: usize,
+    mut bits: usize,
+    initial: EncoderMatchState,
+) -> Result<(usize, EncoderMatchState)> {
     let prices = TokenPrices {
         lengths: lengths.slices(),
     };
@@ -2127,20 +2261,22 @@ fn token_stream_bits_with_state<B: Budget>(
         .map(EncodeToken::Filter)
         .chain(tokens.iter().copied())
     {
-        match token {
-            EncodeToken::Literal(byte) => bits += prices.literal(byte),
+        let token_bits = match token {
+            EncodeToken::Literal(byte) => prices.literal(byte),
             EncodeToken::Match { length, distance } => {
-                bits += prices.match_cost(&state, length, distance, distance_size)?;
+                let cost = prices.match_cost(&state, length, distance, distance_size)?;
                 state.remember(length, distance);
+                cost
             }
             EncodeToken::Filter(filter) => {
-                let mut writer = BitWriter::with_allowance(&allowance);
-                try_write_filter(&mut writer, filter)?;
-                bits += usize::from(lengths.main[256]) + writer.bit_pos;
+                usize::from(lengths.main[256]) + filter_payload_bits(filter)?
             }
-        }
+        };
+        bits = bits
+            .checked_add(token_bits)
+            .ok_or(Error::InvalidData("RAR 5 block bit count overflows"))?;
     }
-    Ok(bits)
+    Ok((bits, state))
 }
 
 struct OptimalWorkspace<B: Budget = Allowance> {
@@ -3042,22 +3178,38 @@ fn literal_presence(data: &[u8]) -> [bool; 256] {
     present
 }
 
-fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) -> Result<()> {
+fn filter_payload_bits(filter: EncodeFilter) -> Result<usize> {
     if filter.offset > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter offset is too large"));
     }
     if filter.length > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter length is too large"));
     }
-    try_write_filter_data(writer, filter.offset as u32)?;
-    try_write_filter_data(writer, filter.length as u32)?;
-    match filter.filter_type {
+    let bits = 2
+        + 8 * filter_data_byte_count(filter.offset as u32)
+        + 2
+        + 8 * filter_data_byte_count(filter.length as u32)
+        + 3;
+    Ok(match filter.filter_type {
         FilterType::Delta => {
             if filter.channels == 0 || filter.channels > MAX_DELTA_CHANNELS {
                 return Err(Error::InvalidData(
                     "RAR 5 DELTA filter channel count is invalid",
                 ));
             }
+            bits + 5
+        }
+        FilterType::E8 | FilterType::E8E9 | FilterType::Arm => bits,
+    })
+}
+
+#[cfg(test)]
+fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) -> Result<()> {
+    filter_payload_bits(filter)?;
+    try_write_filter_data(writer, filter.offset as u32)?;
+    try_write_filter_data(writer, filter.length as u32)?;
+    match filter.filter_type {
+        FilterType::Delta => {
             writer.try_write_bits(0, 3).map_err(Into::into)?;
             writer
                 .try_write_bits(filter.channels - 1, 5)
@@ -3087,6 +3239,7 @@ fn write_valid_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter
     }
 }
 
+#[cfg(test)]
 fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Result<()> {
     let byte_count = filter_data_byte_count(value);
     writer
@@ -3522,6 +3675,10 @@ mod pricing_tests;
 #[cfg(test)]
 #[path = "literal_pricing_tests.rs"]
 mod literal_pricing_tests;
+
+#[cfg(test)]
+#[path = "block_plan_tests.rs"]
+mod block_plan_tests;
 
 #[path = "hybrid_encoder.rs"]
 pub(crate) mod hybrid_encoder;

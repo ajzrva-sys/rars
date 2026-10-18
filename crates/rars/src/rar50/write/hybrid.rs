@@ -8,11 +8,118 @@ use crate::streaming::CapacityCharge;
 use crate::{Error, HybridOptions, Result, WriterResources};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 
 pub(super) struct Captured {
     pub entries: Records<ArchiveEntry>,
     pub stats: DictionaryStats,
     _metadata: Option<CapacityCharge>,
+    pub analysis: Option<Arc<Analysis>>,
+}
+
+// Stable capture identities are projected into the proposed member order.
+// Source-coordinate evidence is only a hint: the codec rechecks transformed bytes.
+#[derive(Clone, Copy, Default)]
+struct Coordinate {
+    ordinal: usize,
+    start: u64,
+}
+pub(crate) struct Analysis {
+    index: Mutex<RepeatIndex>,
+    ids: Records<u64>,
+    coordinates: Records<Coordinate>,
+    _cache: Option<CapacityCharge>,
+}
+impl std::fmt::Debug for Analysis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Analysis")
+            .field("members", &self.ids.len())
+            .finish_non_exhaustive()
+    }
+}
+impl Analysis {
+    #[allow(clippy::too_many_arguments)]
+    fn hints(
+        &self,
+        member: usize,
+        offset: u64,
+        input: &[u8],
+        dictionary: usize,
+        solid: bool,
+        allowance: &crate::codec::workspace::Limited,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<
+        crate::codec::workspace::Buffer<
+            crate::codec::rar50::HybridMatchHint,
+            crate::codec::workspace::Limited,
+        >,
+    > {
+        let mut hints = crate::codec::workspace::Buffer::new(allowance);
+        let Some(&id) = self.ids.get(member) else {
+            return Err(Error::WriterFailure(
+                "hybrid analysis member identity is missing",
+            ));
+        };
+        let coordinate = self.coordinates[id as usize];
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        // This is a bounded selection from a complete index, never a claim that
+        // unvisited origins or occurrences are match-free.
+        let mut quota = crate::hybrid::QueryBudget::new(16_384);
+        let mut retained = 0usize;
+        for at in (0..input.len().saturating_sub(3)).step_by(4096) {
+            if quota.remaining() == 0 || retained == 256 {
+                break;
+            }
+            let length = (input.len() - at).min(32);
+            let current = coordinate
+                .start
+                .checked_add(offset)
+                .and_then(|v| v.checked_add(at as u64))
+                .ok_or(Error::InvalidArgument("hybrid stream offset overflows"))?;
+            index.for_each_occurrence_bounded(
+                &input[at..at + length],
+                &mut quota,
+                cancelled,
+                &mut |hit| {
+                    let Some(previous) = self.coordinates.get(hit.member_id as usize) else {
+                        return Err(Error::WriterFailure(
+                            "hybrid occurrence member identity is invalid",
+                        ));
+                    };
+                    if previous.ordinal > coordinate.ordinal || (!solid && hit.member_id != id) {
+                        return Ok(true);
+                    }
+                    let prior = previous
+                        .start
+                        .checked_add(hit.offset)
+                        .ok_or(Error::InvalidArgument("hybrid stream offset overflows"))?;
+                    if prior >= current {
+                        return Ok(true);
+                    }
+                    let distance = current - prior;
+                    if distance > dictionary as u64 {
+                        return Ok(true);
+                    }
+                    let distance = distance as usize;
+                    if !hints
+                        .iter()
+                        .any(|hint: &crate::codec::rar50::HybridMatchHint| {
+                            hint.offset == at && hint.distance == distance
+                        })
+                    {
+                        hints.push(crate::codec::rar50::HybridMatchHint {
+                            offset: at,
+                            distance,
+                            maxlen: (input.len() - at).min(4096),
+                        })?;
+                        retained += 1;
+                    }
+                    Ok(retained < 256)
+                },
+            )?;
+        }
+        Ok(hints)
+    }
 }
 
 pub(super) fn validate(
@@ -131,6 +238,7 @@ pub(super) fn capture(
         None
     };
     let mut captured = Records::new(entries.len(), resources)?;
+    let mut ids = Records::collect((0..entries.len()).map(|id| Ok(id as u64)), resources)?;
     let mut stats = DictionaryStats::default();
     let mut used_disk = 0u64;
     let mut input = [0u8; 64 * 1024];
@@ -205,17 +313,38 @@ pub(super) fn capture(
         }
     }
     tracker.check()?;
-    if let Some(mut index) = global {
+    let analysis = if let Some(mut index) = global {
         stats = index.stats().clone();
         if hybrid.member_order_optimization && hybrid.variant & 16 != 0 {
             reorder(
                 &mut captured,
+                &mut ids,
                 &mut index,
                 hybrid.dictionary_ceiling,
                 resources,
             )?;
         }
-    }
+        index.seal()?;
+        let mut coordinates = Records::collect(
+            (0..entries.len()).map(|_| Ok(Coordinate::default())),
+            resources,
+        )?;
+        let mut start = 0u64;
+        for (ordinal, (&id, entry)) in ids.iter().zip(captured.iter()).enumerate() {
+            coordinates[id as usize] = Coordinate { ordinal, start };
+            start = start
+                .checked_add(entry.source.len()?)
+                .ok_or(Error::InvalidArgument("hybrid stream size overflows"))?;
+        }
+        Some(Arc::new(Analysis {
+            index: Mutex::new(index),
+            ids,
+            coordinates,
+            _cache: cache_charge,
+        }))
+    } else {
+        None
+    };
     if let Some(progress) = progress {
         progress.report(crate::WriteProgressEvent::OperationFinished {
             operation: crate::WriteOperation::Staging,
@@ -228,6 +357,7 @@ pub(super) fn capture(
         entries: captured,
         stats,
         _metadata: metadata,
+        analysis,
     })
 }
 
@@ -244,6 +374,7 @@ fn merge_stats(into: &mut DictionaryStats, from: &DictionaryStats) {
 // The complete index remains exact; ordering uses explicitly bounded hints.
 fn reorder(
     entries: &mut [ArchiveEntry],
+    ids: &mut [u64],
     index: &mut RepeatIndex,
     dictionary: u64,
     resources: &WriterResources,
@@ -255,7 +386,6 @@ fn reorder(
     {
         return Ok(());
     }
-    let original_names: Vec<_> = entries.iter().map(|entry| entry.name.clone()).collect();
     let mut begin = 0;
     while begin < entries.len() {
         if entries[begin].is_directory || entries[begin].redirection.is_some() {
@@ -275,10 +405,7 @@ fn reorder(
             if resources.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let current_id = original_names
-                .iter()
-                .position(|name| *name == entries[position].name)
-                .unwrap() as u64;
+            let current_id = ids[position];
             let size = entries[position].source.len()?;
             let length = size.min(64) as usize;
             if length == 0 {
@@ -293,10 +420,7 @@ fn reorder(
             let (hits, _) = index.occurrences_limited(&pattern, 128)?;
             let best = (position + 1..end)
                 .filter_map(|candidate| {
-                    let id = original_names
-                        .iter()
-                        .position(|name| *name == entries[candidate].name)
-                        .unwrap() as u64;
+                    let id = ids[candidate];
                     let score = hits
                         .iter()
                         .filter(|hit| {
@@ -310,6 +434,7 @@ fn reorder(
                 .max_by(|(ai, a), (bi, b)| a.cmp(b).then_with(|| bi.cmp(ai)));
             if let Some((best, _)) = best {
                 entries[position + 1..=best].rotate_right(1);
+                ids[position + 1..=best].rotate_right(1);
             }
             position += 1;
         }
@@ -369,19 +494,10 @@ fn codec_options(
 }
 
 fn workspace(dictionary: u64, options: HybridOptions) -> u64 {
-    let visits = if options.profile == crate::HybridProfile::Server {
-        64
-    } else {
-        16
-    };
-    let states = if options.variant & 2 == 0 {
-        1
-    } else {
-        options.candidate_states() as u64
-    };
-    dictionary
-        .saturating_mul(8)
-        .saturating_add((256 * 1024u64).saturating_mul(visits * 8 + states * 40 + 192))
+    crate::codec::rar50::hybrid_workspace_required(
+        dictionary,
+        codec_options(options, &super::FilterPolicy::None),
+    )
 }
 
 pub(super) fn select_dictionary(
@@ -428,7 +544,13 @@ pub(super) fn select_dictionary(
             version,
             allowance,
         )?;
-        for entry in captured.entries.iter() {
+        let mut chain = crate::codec::rar50::CommittedChain::new_from_history(
+            state.history(),
+            dictionary as usize,
+            state.stream_offset,
+            allowance,
+        )?;
+        for (member, entry) in captured.entries.iter().enumerate() {
             let size = entry.source.len()?;
             if sampled >= target_bytes {
                 break;
@@ -441,9 +563,18 @@ pub(super) fn select_dictionary(
                     allowance,
                 )?;
             }
+            if !options.features.solid {
+                chain = crate::codec::rar50::CommittedChain::new_from_history(
+                    state.history(),
+                    dictionary as usize,
+                    state.stream_offset,
+                    allowance,
+                )?;
+            }
             state.begin_member();
             let mut reader = entry.source.open()?;
             let mut remaining = size.min((target_bytes - sampled) as u64);
+            let partial_member = remaining < size;
             let mut read_window = || -> Result<crate::codec::workspace::Buffer<u8, crate::codec::workspace::Limited>> {
                 if resources.is_cancelled() { return Err(Error::Cancelled); }
                 let length = remaining.min(256 * 1024) as usize;
@@ -455,12 +586,26 @@ pub(super) fn select_dictionary(
             let mut current = read_window()?;
             let mut next = read_window()?;
             while !current.is_empty() {
-                let result = crate::codec::rar50::encode_partition(
+                let hints = match &captured.analysis {
+                    Some(analysis) => analysis.hints(
+                        member,
+                        state.member_offset,
+                        &current,
+                        dictionary as usize,
+                        options.features.solid,
+                        allowance,
+                        &|| resources.is_cancelled(),
+                    )?,
+                    None => crate::codec::workspace::Buffer::new(allowance),
+                };
+                let result = crate::codec::rar50::encode_partition_with_chain(
                     &current,
                     &next,
                     &state,
                     config,
                     mandatory,
+                    &hints,
+                    &mut chain,
                     next.is_empty(),
                     allowance,
                     &control,
@@ -477,11 +622,16 @@ pub(super) fn select_dictionary(
                     .saturating_add(result.work.chain_candidates)
                     .saturating_add(result.work.greedy_searches)
                     .saturating_add(result.work.seeded_positions)
+                    .saturating_add(result.work.overlay_positions)
+                    .saturating_add(result.work.compared_bytes)
                     .saturating_add(current.len() as u64);
                 sampled += current.len();
                 state = result.end_state;
                 current = next;
                 next = read_window()?;
+            }
+            if partial_member {
+                break;
             }
         }
         measurements.push(DictionaryMeasurement {
@@ -503,6 +653,16 @@ pub(super) fn select_dictionary(
 
 pub(super) fn compress_members(
     sources: &[crate::EntrySource],
+    plan: &super::compress::CompressPlan,
+    resources: &WriterResources,
+    progress: &dyn super::compress::CompressionProgress,
+    context: &(dyn Fn(usize, Error) -> Error + Sync),
+) -> Result<Records<super::compress::CompressedMember>> {
+    compress_members_at(sources, 0, plan, resources, progress, context)
+}
+fn compress_members_at(
+    sources: &[crate::EntrySource],
+    first_member: usize,
     plan: &super::compress::CompressPlan,
     resources: &WriterResources,
     progress: &dyn super::compress::CompressionProgress,
@@ -538,8 +698,9 @@ pub(super) fn compress_members(
                         inner: progress,
                         member: index,
                     };
-                    let mut result = compress_members(
+                    let mut result = compress_members_at(
                         std::slice::from_ref(&source),
+                        first_member + index,
                         plan,
                         worker,
                         &mapped,
@@ -565,6 +726,12 @@ pub(super) fn compress_members(
         plan.algorithm_version,
         allowance,
     )?;
+    let mut chain = crate::codec::rar50::CommittedChain::new_from_history(
+        state.history(),
+        plan.dictionary_size as usize,
+        state.stream_offset,
+        allowance,
+    )?;
     let mut results = Records::new(sources.len(), resources)?;
     for (member, source) in sources.iter().enumerate() {
         if resources.is_cancelled() || progress.is_cancelled() {
@@ -575,6 +742,14 @@ pub(super) fn compress_members(
                 &[],
                 plan.dictionary_size as usize,
                 plan.algorithm_version,
+                allowance,
+            )?;
+        }
+        if !plan.solid {
+            chain = crate::codec::rar50::CommittedChain::new_from_history(
+                state.history(),
+                plan.dictionary_size as usize,
+                state.stream_offset,
                 allowance,
             )?;
         }
@@ -603,7 +778,11 @@ pub(super) fn compress_members(
             };
             let config = codec_options(hybrid, &plan.filter_policy);
             while !current.is_empty() {
-                let result = crate::codec::rar50::encode_partition(&current, &next, &state, config, mandatory, next.is_empty(), allowance, &crate::read_control::ReadControl::default(), &|| resources.is_cancelled() || progress.is_cancelled(), None)?;
+                let hints = match &resources.hybrid_analysis {
+                    Some(analysis) => analysis.hints(first_member + member, state.member_offset, &current, plan.dictionary_size as usize, plan.solid, allowance, &|| resources.is_cancelled() || progress.is_cancelled())?,
+                    None => crate::codec::workspace::Buffer::new(allowance),
+                };
+                let result = crate::codec::rar50::encode_partition_with_chain(&current, &next, &state, config, mandatory, &hints, &mut chain, next.is_empty(), allowance, &crate::read_control::ReadControl::default(), &|| resources.is_cancelled() || progress.is_cancelled(), None)?;
                 debug_assert_eq!(result.history_append.len(), current.len());
                 debug_assert!(!next.is_empty() || result.next_cost == 0);
                 debug_assert!(result.partition_id < 4 && result.representation_id < 6);
@@ -678,6 +857,7 @@ mod dictionary_tests {
             .unwrap(),
             stats: DictionaryStats::default(),
             _metadata: None,
+            analysis: None,
         };
         let options = WriterOptions::new(
             crate::ArchiveVersion::Rar50,
@@ -698,5 +878,104 @@ mod dictionary_tests {
             .unwrap(),
             [8 * 1024 * 1024]
         );
+    }
+}
+
+#[cfg(test)]
+mod analysis_tests {
+    use super::*;
+
+    fn entries() -> Vec<ArchiveEntry> {
+        [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .map(|name| {
+                ArchiveEntry::new(
+                    name.to_vec(),
+                    crate::EntrySource::from_bytes(
+                        b"relationship-aware exact repeated bytes".repeat(4),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retained_index_projects_into_actual_solid_reach_and_resets() {
+        let hybrid = HybridOptions::default()
+            .with_variant(0)
+            .unwrap()
+            .with_archive_analysis(true);
+        let resources = resources(&WriterResources::default(), hybrid);
+        let captured = capture(&entries(), hybrid, &resources, None).unwrap();
+        let analysis = captured.analysis.as_ref().unwrap();
+        let allowance = resources.execution.as_ref().unwrap();
+        let input = b"relationship-aware exact repeated bytes".repeat(4);
+        let solid = analysis
+            .hints(1, 0, &input, 65536, true, allowance, &|| false)
+            .unwrap();
+        assert!(solid
+            .iter()
+            .any(|hint| hint.offset == 0 && hint.distance == input.len()));
+        let reset = analysis
+            .hints(1, 0, &input, 65536, false, allowance, &|| false)
+            .unwrap();
+        assert!(reset.is_empty());
+        let unreachable = analysis
+            .hints(1, 0, &input, 1, true, allowance, &|| false)
+            .unwrap();
+        assert!(unreachable.is_empty());
+        assert!(matches!(
+            analysis.hints(0, 0, &input, 65536, true, allowance, &|| true),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn projected_identities_follow_reordered_members_not_names() {
+        let hybrid = HybridOptions::default()
+            .with_variant(16)
+            .unwrap()
+            .with_archive_analysis(true)
+            .with_member_order_optimization(true);
+        let resources = resources(&WriterResources::default(), hybrid);
+        let mut inputs = entries();
+        inputs.insert(
+            1,
+            ArchiveEntry::new(
+                b"unrelated".to_vec(),
+                crate::EntrySource::from_bytes(vec![0x9b; 97]),
+            ),
+        );
+        let captured = capture(&inputs, hybrid, &resources, None).unwrap();
+        let names: Vec<_> = captured
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_slice())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                b"first".as_slice(),
+                b"second".as_slice(),
+                b"unrelated".as_slice()
+            ]
+        );
+        let analysis = captured.analysis.as_ref().unwrap();
+        assert_eq!(&*analysis.ids, &[0, 2, 1]);
+        let input = b"relationship-aware exact repeated bytes".repeat(4);
+        let hints = analysis
+            .hints(
+                1,
+                0,
+                &input,
+                65536,
+                true,
+                resources.execution.as_ref().unwrap(),
+                &|| false,
+            )
+            .unwrap();
+        assert!(hints
+            .iter()
+            .any(|hint| hint.offset == 0 && hint.distance == input.len()));
     }
 }

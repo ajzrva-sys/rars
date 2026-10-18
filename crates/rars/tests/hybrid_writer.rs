@@ -243,3 +243,44 @@ fn hybrid_worker_schedules_do_not_change_archive_bytes() {
     };
     assert_eq!(encode(1), encode(2));
 }
+
+#[test]
+fn analyzed_reordered_members_roundtrip_in_actual_solid_order() {
+    for target in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        let mut features = FeatureSet::store_only();
+        features.solid = true;
+        let mut selected = options(target).with_hybrid(
+            HybridOptions::default()
+                .with_variant(20)
+                .unwrap()
+                .with_archive_analysis(true)
+                .with_member_order_optimization(true),
+        );
+        selected.features = features;
+        let related = b"related exact bytes preserving independent members\n".repeat(43);
+        let unrelated = vec![0x9b; 97];
+        let archive = Rar50Writer::new(selected)
+            .entry(ArchiveEntry::new(
+                b"first".to_vec(),
+                EntrySource::from_bytes(related.clone()),
+            ))
+            .entry(ArchiveEntry::new(
+                b"unrelated".to_vec(),
+                EntrySource::from_bytes(unrelated.clone()),
+            ))
+            .entry(ArchiveEntry::new(
+                b"second".to_vec(),
+                EntrySource::from_bytes(related.clone()),
+            ))
+            .finish()
+            .unwrap();
+        assert_eq!(
+            contents(&archive),
+            vec![
+                (b"first".to_vec(), related.clone()),
+                (b"second".to_vec(), related),
+                (b"unrelated".to_vec(), unrelated),
+            ]
+        );
+    }
+}

@@ -263,6 +263,8 @@ impl WriteCancellation {
 /// bare-WASM spool payload and index capacity, excluding other writer memory.
 pub struct WriterResources {
     pub(crate) hybrid: Option<crate::HybridOptions>,
+    #[cfg(feature = "write")]
+    pub(crate) hybrid_analysis: Option<Arc<crate::rar50::write::hybrid::Analysis>>,
     memory_limit: u64,
     temp_dir: Option<Arc<PathBuf>>,
     budget: Arc<MemoryBudget>,
@@ -284,6 +286,8 @@ impl WriterResources {
     pub fn new(memory_limit: u64) -> Self {
         Self {
             hybrid: None,
+            #[cfg(feature = "write")]
+            hybrid_analysis: None,
             memory_limit,
             temp_dir: None,
             budget: Arc::new(MemoryBudget::new(memory_limit)),
