@@ -481,7 +481,12 @@ def execute(command, cwd, area, label, deadline, environment):
             raise
         process.returncode = os.waitstatus_to_exitcode(status)
     wall = time.monotonic() - start
-    rss = usage.ru_maxrss * (1024 if sys.platform.startswith("linux") else 1) if sys.platform in ("darwin", "linux") else None
+    if sys.platform == "darwin":
+        rss = usage.ru_maxrss
+    elif sys.platform.startswith(("linux", "freebsd")):
+        rss = usage.ru_maxrss * 1024
+    else:
+        rss = None
     result = {"command": command, "exit": process.returncode, "timeout": timed_out,
               "wall_seconds": wall, "cpu_seconds": usage.ru_utime + usage.ru_stime,
               "peak_rss_bytes": rss, "filesystem_input_blocks": usage.ru_inblock,

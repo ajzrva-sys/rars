@@ -7,6 +7,10 @@ native RAR executable. It reports measurements and verified Pareto candidates;
 it does not assert native parity or apply a size-percentage or archive-byte
 identity acceptance rule.
 
+Local and SSH workers support macOS, Linux and FreeBSD with compatible frozen
+executables. Peak RSS uses macOS byte units and converts Linux/FreeBSD KiB units
+to bytes; unknown platforms retain an unavailable RSS measurement.
+
 Generate the related-release, distance, shifted and unrelated fixtures alongside the existing corpus:
 
 ```sh

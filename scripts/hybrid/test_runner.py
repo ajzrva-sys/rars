@@ -121,6 +121,20 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(runner.RunError): runner.choices(wrong)
         with self.assertRaises(runner.RunError): runner.configs(["desktop", "desktop"])
 
+    def test_execute_reports_peak_rss_in_platform_units(self):
+        usage = mock.Mock(ru_maxrss=1234, ru_utime=1, ru_stime=2, ru_inblock=0, ru_oublock=0)
+        process = mock.Mock(pid=42)
+        for system, expected in (("darwin", 1234), ("linux", 1234 * 1024),
+                                 ("freebsd14", 1234 * 1024), ("freebsd15", 1234 * 1024),
+                                 ("unknown", None)):
+            with self.subTest(platform=system), \
+                 mock.patch.object(runner.sys, "platform", system), \
+                 mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+                 mock.patch.object(runner.os, "wait4", return_value=(42, 0, usage)):
+                result = runner.execute(["frozen-encoder"], self.root, self.root,
+                                        system, time.monotonic() + 5, {})
+                self.assertEqual(result["peak_rss_bytes"], expected)
+
     def test_freeze_hashes_and_stable_tasks(self):
         m = self.freeze()
         self.assertEqual(m, runner.load(self.run))
