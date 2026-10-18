@@ -125,7 +125,7 @@ def execution_settings(value=None):
     defaults = {"parallel_screening": False, "screen_threads": 1, "confirm_threads": 1}
     if value is None:
         return defaults
-    if not isinstance(value, dict) or set(value) - set(defaults):
+    if not isinstance(value, dict) or set(value) - (set(defaults) | {"screen_failure_policy"}):
         raise RunError("unknown execution setting")
     result = {**defaults, **value}
     if not isinstance(result["parallel_screening"], bool):
@@ -133,6 +133,8 @@ def execution_settings(value=None):
     for key in ("screen_threads", "confirm_threads"):
         if isinstance(result[key], bool) or not isinstance(result[key], int) or not 1 <= result[key] <= 4096:
             raise RunError("execution thread counts must be positive integers at most 4096")
+    if result.get("screen_failure_policy", "configuration") not in ("configuration", "workload"):
+        raise RunError("screen_failure_policy must be configuration or workload")
     return result
 
 
@@ -869,7 +871,8 @@ def parallel_screen(run, m, host, max_tasks=None):
         if allowance <= 0:
             return {"tasks_run": 0, "paused": False}
         previous = latest(rows)
-        failed = {r["task"]["configuration"] for r in previous.values() if r["event"] == "failed"}
+        configuration_failures = execution_settings(m.get("execution")).get("screen_failure_policy", "configuration") == "configuration"
+        failed = {r["task"]["configuration"] for r in previous.values() if r["event"] == "failed"} if configuration_failures else set()
         invalid = {(r["configuration"], r["case"]): r for r in m.get("invalid_combinations", [])}
         blocks = []
         planned_count = 0
@@ -936,7 +939,7 @@ def parallel_screen(run, m, host, max_tasks=None):
                 completed["charged_seconds"] = time.monotonic() - begin
                 completed["charge_scope"] = "diagnostic job timing; host phase accounts budget"
                 outcomes.append(completed)
-                failed_configuration = completed["event"] == "failed"
+                failed_configuration = configuration_failures and completed["event"] == "failed"
                 if completed.get("control_failure"):
                     cancelled.set()
                     break
@@ -1044,7 +1047,8 @@ def worker(run, host_id, max_tasks=None):
                         rows = journal(run)
                         if task_id(task) in latest(rows):
                             continue
-                        failed = {r["task"]["configuration"] for r in latest(rows).values() if r["event"] == "failed"}
+                        configuration_failures = phase != "screen" or execution_settings(m.get("execution")).get("screen_failure_policy", "configuration") == "configuration"
+                        failed = {r["task"]["configuration"] for r in latest(rows).values() if r["event"] == "failed"} if configuration_failures else set()
                         if task["configuration"] in failed:
                             append(run, {"event": "excluded", "task": task, "task_id": task_id(task), "host": host_id,
                                          "charged_seconds": 0, "reason": "configuration has a failed correctness sample"})
@@ -1112,7 +1116,7 @@ def absolute_frontiers(samples):
             all(a <= b for a, b in zip(other, metric)) and any(a < b for a, b in zip(other, metric))
             for other_name, other in metrics.items() if other_name != name)]
         result[key] = {"absolute_candidate_metrics": metrics, "frontier": sorted(frontier),
-                       "scope": "within-workload/host absolute measurements; not cross-host promotion scores"}
+                       "scope": "diagnostic within-workload/host absolute measurements; partial workload coverage does not confer promotion eligibility; not cross-host promotion scores"}
     return result
 
 

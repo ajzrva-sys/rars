@@ -93,7 +93,11 @@ extractions. Active phase wall time includes scheduling, journals, selection and
 correctness work. OS I/O blocking and process-termination latency cannot be
 preempted, so this is a cooperative budget, not a hard real-time guarantee.
 Interrupted tasks conservatively consume their full reservation. Failed or interrupted samples are not automatically retried.
-Control failure stops the run; candidate failure excludes that configuration.
+Control failure stops the run; candidate failure excludes that configuration by
+default. Set `execution.screen_failure_policy` to `"workload"` to retain a failed
+screening task and continue that configuration's other workloads. Such partial
+coverage remains diagnostic and cannot enter finalist confirmation; confirmation
+failures still exclude the configuration.
 A screening timeout is a screening refusal, not proof of incorrect extraction.
 
 ### CPU-parallel screening and exclusive confirmation
