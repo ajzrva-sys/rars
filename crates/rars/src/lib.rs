@@ -49,7 +49,7 @@ pub mod filter;
 #[cfg(feature = "write")]
 pub mod hybrid;
 #[cfg(feature = "write")]
-pub use hybrid::{HybridOptions, HybridProfile};
+pub use hybrid::{HybridArchitecture, HybridOptions, HybridProfile};
 #[cfg(feature = "write")]
 mod filter_search;
 mod io_util;

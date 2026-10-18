@@ -1,4 +1,7 @@
 use super::DictionaryStats;
+use crate::streaming::StorageCharge;
+#[cfg(any(test, feature = "write"))]
+use crate::WriterResources;
 use crate::{EntrySource, Error, Result};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -6,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const NONE: u64 = u64::MAX;
 const PAGE: usize = 4096;
@@ -38,11 +41,27 @@ pub struct Occurrence {
 #[derive(Debug)]
 struct Storage {
     directory: PathBuf,
+    // Sources and open range readers retain this same owner. No reservation
+    // is released just because the tree/cache or capture coordinator is gone.
+    charge: Mutex<Option<StorageCharge>>,
 }
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.directory);
+        if let Err(error) = std::fs::remove_dir_all(&self.directory) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                // Match native Spool's policy: unresolved cleanup still owns
+                // disk bytes, so do not admit replacement storage over them.
+                if let Some(charge) = self
+                    .charge
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+                {
+                    charge.retain_debt();
+                }
+            }
+        }
     }
 }
 
@@ -365,7 +384,36 @@ pub struct RepeatIndex {
 
 impl RepeatIndex {
     pub fn create(directory: impl AsRef<Path>, limits: IndexLimits) -> Result<Self> {
-        let directory = directory.as_ref();
+        Self::create_with_charge(directory.as_ref(), limits, None)
+    }
+
+    /// Share the writer's logical-spool quota. Root storage is reserved before
+    /// creating any files; every later growth is admitted before its write.
+    #[cfg(any(test, feature = "write"))]
+    pub(crate) fn create_with_resources(
+        directory: impl AsRef<Path>,
+        limits: IndexLimits,
+        resources: &WriterResources,
+    ) -> Result<Self> {
+        if limits.max_disk_bytes < Node::WIDTH as u64 {
+            return Err(Error::WriterSpoolLimitExceeded {
+                limit: limits.max_disk_bytes,
+                required: Node::WIDTH as u64,
+                used: 0,
+            });
+        }
+        let charge = resources.reserve_external_spool(Node::WIDTH as u64)?;
+        Self::create_with_charge(directory.as_ref(), limits, charge)
+    }
+
+    fn create_with_charge(
+        directory: &Path,
+        limits: IndexLimits,
+        charge: Option<StorageCharge>,
+    ) -> Result<Self> {
+        // Keep the reservation outside the retry loop until ownership of the
+        // newly created directory is established.
+        let mut charge = charge;
         let storage = loop {
             let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = directory.join(format!("rars-hybrid-{}-{id}", std::process::id()));
@@ -373,7 +421,12 @@ impl RepeatIndex {
             #[cfg(unix)]
             builder.mode(0o700);
             match builder.create(&path) {
-                Ok(()) => break Arc::new(Storage { directory: path }),
+                Ok(()) => {
+                    break Arc::new(Storage {
+                        directory: path,
+                        charge: Mutex::new(charge.take()),
+                    })
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
             }
@@ -453,7 +506,17 @@ impl RepeatIndex {
                 used: self.disk_used,
             });
         }
-        self.disk_used = required.expect("checked disk reservation");
+        let required = required.expect("checked disk reservation");
+        if let Some(charge) = self
+            .storage
+            .charge
+            .lock()
+            .expect("hybrid storage quota lock poisoned")
+            .as_mut()
+        {
+            charge.grow_to(required)?;
+        }
+        self.disk_used = required;
         Ok(())
     }
     fn new_node(&mut self, node: Node) -> Result<u64> {

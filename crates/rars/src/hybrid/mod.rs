@@ -10,8 +10,8 @@ mod options;
 
 pub use index::{IndexLimits, Occurrence, RepeatIndex};
 pub use options::{
-    choose_minimax, dictionary_shortlist, DictionaryMeasurement, DictionaryStats, HybridOptions,
-    HybridProfile,
+    choose_minimax, dictionary_shortlist, DictionaryMeasurement, DictionaryStats,
+    HybridArchitecture, HybridOptions, HybridProfile,
 };
 
 #[cfg(test)]

@@ -7,10 +7,19 @@ pub enum HybridProfile {
     Server,
 }
 
+/// Complete encoder architectures retained as explicit experimental controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridArchitecture {
+    Hybrid,
+    Relationships,
+    Streams,
+}
+
 /// Hybrid settings. Explicit writer resource ceilings remain authoritative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HybridOptions {
+    pub architecture: HybridArchitecture,
     pub profile: HybridProfile,
     pub variant: u8,
     pub dictionary_ceiling: u64,
@@ -27,6 +36,7 @@ impl Default for HybridOptions {
 impl HybridOptions {
     pub const fn new(profile: HybridProfile) -> Self {
         Self {
+            architecture: HybridArchitecture::Hybrid,
             profile,
             variant: 63,
             dictionary_ceiling: match profile {
@@ -44,6 +54,11 @@ impl HybridOptions {
         }
         self.variant = variant;
         Ok(self)
+    }
+
+    pub const fn with_architecture(mut self, architecture: HybridArchitecture) -> Self {
+        self.architecture = architecture;
+        self
     }
 
     pub const fn with_dictionary_ceiling(mut self, ceiling: u64) -> Self {

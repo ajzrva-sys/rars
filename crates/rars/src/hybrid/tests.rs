@@ -381,6 +381,143 @@ fn refused_construction_leaves_no_half_directory_or_private_payload() {
 }
 
 #[test]
+fn shared_spool_quota_precedes_root_member_raw_and_node_writes() {
+    let directory = crate::scratch::case("hybrid-shared-spool");
+    let limits = IndexLimits {
+        cache_bytes: 0,
+        max_disk_bytes: 1_000_000,
+    };
+    let resources = crate::WriterResources::default().with_max_spool_bytes(176);
+    let mut first = RepeatIndex::create_with_resources(&*directory, limits, &resources).unwrap();
+    let second = RepeatIndex::create_with_resources(&*directory, limits, &resources).unwrap();
+    assert_eq!(resources.spool_remaining(), Some(0));
+    assert!(matches!(
+        RepeatIndex::create_with_resources(directory.join("missing"), limits, &resources),
+        Err(Error::WriterSpoolLimitExceeded {
+            required: 264,
+            used: 176,
+            ..
+        })
+    ));
+    assert!(matches!(
+        first.begin_member(0),
+        Err(Error::WriterSpoolLimitExceeded {
+            required: 216,
+            used: 176,
+            ..
+        })
+    ));
+    assert_eq!(first.disk_bytes(), 88);
+    assert_eq!(
+        std::fs::metadata(first.test_directory().join("members"))
+            .unwrap()
+            .len(),
+        0
+    );
+    drop(second);
+    assert_eq!(resources.spool_remaining(), Some(88));
+    drop(first);
+    assert_eq!(resources.spool_remaining(), Some(176));
+
+    for quota in [128, 129] {
+        let resources = crate::WriterResources::default().with_max_spool_bytes(quota);
+        let mut tree = RepeatIndex::create_with_resources(&*directory, limits, &resources).unwrap();
+        tree.begin_member(0).unwrap();
+        assert!(matches!(
+            tree.append(b"x"),
+            Err(Error::WriterSpoolLimitExceeded { .. })
+        ));
+        // At128 the raw byte is refused; at129 raw admission succeeds but
+        // the new leaf is refused before enlarging the node file.
+        assert_eq!(
+            std::fs::metadata(tree.test_directory().join("captured"))
+                .unwrap()
+                .len(),
+            quota - 128
+        );
+        assert_eq!(
+            std::fs::metadata(tree.test_directory().join("nodes"))
+                .unwrap()
+                .len(),
+            88
+        );
+        assert!(matches!(
+            tree.occurrences(b"x"),
+            Err(Error::WriterFailure(_))
+        ));
+        drop(tree);
+        assert_eq!(resources.spool_remaining(), Some(quota));
+    }
+    assert_eq!(std::fs::read_dir(&*directory).unwrap().count(), 0);
+}
+
+#[test]
+fn captured_source_and_open_reader_retain_shared_spool_charge_and_send_sync() {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<RepeatIndex>();
+    send_sync::<crate::EntrySource>();
+    let directory = crate::scratch::case("hybrid-retained-spool");
+    let limit = 1_000_000;
+    let resources = crate::WriterResources::default().with_max_spool_bytes(limit);
+    let mut tree = RepeatIndex::create_with_resources(
+        &*directory,
+        IndexLimits {
+            cache_bytes: 1024,
+            max_disk_bytes: limit,
+        },
+        &resources,
+    )
+    .unwrap();
+    tree.begin_member(0).unwrap();
+    tree.append(b"retained capture").unwrap();
+    tree.finish_member().unwrap();
+    let used = tree.disk_bytes();
+    let source = tree.member_source(0).unwrap();
+    let mut reader = source.open().unwrap();
+    drop(tree);
+    assert_eq!(resources.spool_remaining(), Some(limit - used));
+    drop(source);
+    assert_eq!(resources.spool_remaining(), Some(limit - used));
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"retained capture");
+    drop(reader);
+    assert_eq!(resources.spool_remaining(), Some(limit));
+    assert_eq!(std::fs::read_dir(&*directory).unwrap().count(), 0);
+}
+
+#[test]
+fn shared_constructor_reservation_rolls_back_on_io_and_local_limit_refusal() {
+    let directory = crate::scratch::case("hybrid-constructor-quota");
+    let resources = crate::WriterResources::default().with_max_spool_bytes(1000);
+    assert!(matches!(
+        RepeatIndex::create_with_resources(
+            directory.join("missing/parent"),
+            IndexLimits {
+                cache_bytes: 0,
+                max_disk_bytes: 1000
+            },
+            &resources
+        ),
+        Err(Error::Io(_))
+    ));
+    assert_eq!(resources.spool_remaining(), Some(1000));
+    assert!(matches!(
+        RepeatIndex::create_with_resources(
+            &*directory,
+            IndexLimits {
+                cache_bytes: 0,
+                max_disk_bytes: 87
+            },
+            &resources
+        ),
+        Err(Error::WriterSpoolLimitExceeded { limit: 87, .. })
+    ));
+    assert_eq!(resources.spool_remaining(), Some(1000));
+    assert_eq!(std::fs::read_dir(&*directory).unwrap().count(), 0);
+}
+
+#[test]
 fn index_state_errors_and_unique_empty_member_terminators() {
     let mut tree = index(1024, 1_000_000);
     assert!(tree.append(b"x").is_err());
