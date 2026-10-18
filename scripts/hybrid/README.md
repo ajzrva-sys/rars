@@ -44,7 +44,9 @@ selection. Every combined-hybrid variant explicitly requests relationship
 analysis; bit 4 changes ordering alone. Hybrid, relationships and streams omit
 an explicit dictionary request. The filter bit explicitly requests `--auto-filter` when on and `--no-filter` when off; a separately requested mandatory filter remains authoritative. Solid/filter combinations unsupported by the CLI are frozen as pre-dispatch exclusions with no child launch; all 64 configurations remain represented. Eligibility and confirmation require every applicable valid workload, at least one valid workload, and report omitted coverage explicitly. Configurations covering different applicable subsets are not evidence of a universal winner.
 
-All encoders use level 3 and one thread. Ordinary rars/native controls request
+All encoders use level 3. The default thread count is one; optional frozen
+execution settings can request separate matched screening/confirmation thread
+counts for every encoder and decoder. Ordinary rars/native controls request
 the same mechanically fitted dictionary: the next power of two reaching the
 largest regular member (the sum for solid workloads), at least 128 KiB, clipped
 to 4 MiB for desktop or 64 MiB for server. These settings are recorded per
@@ -82,8 +84,9 @@ control limitation.
 
 Screening has a maximum **four aggregate host-hours**, confirmation twelve.
 Multiple hosts receive fixed equal shares, so disconnected/exported workers
-cannot multiply the total allowance. Each task reserves at most 300 seconds
-including encoding, decoding and correctness work. The process group is killed
+cannot multiply the total allowance. Each task defaults to a 300-second limit;
+the frozen plan may override it. This includes encoding, decoding and correctness
+work. The process group is killed
 when its task reservation expires; normal scheduler/termination overhead is
 recorded, not hidden. Task deadlines precede validation and are checked while hashing and verifying
 extractions. Active phase wall time includes scheduling, journals, selection and
@@ -91,6 +94,38 @@ correctness work. OS I/O blocking and process-termination latency cannot be
 preempted, so this is a cooperative budget, not a hard real-time guarantee.
 Interrupted tasks conservatively consume their full reservation. Failed or interrupted samples are not automatically retried.
 Control failure stops the run; candidate failure excludes that configuration.
+A screening timeout is a screening refusal, not proof of incorrect extraction.
+
+### CPU-parallel screening and exclusive confirmation
+
+Set the optional plan execution settings before freezing:
+
+```json
+{"execution":{"parallel_screening":true,"screen_threads":1,"confirm_threads":16}}
+```
+
+Each inventory entry supplies `screening_slots`, with optional `logical_cpus`
+and `memory_budget_bytes` admission bounds. For example, 32 slots on a 40-CPU
+host and 80 on a 96-CPU host leave capacity for the OS. The maximum controlled
+memory per screening job is reserved in the frozen admission calculation;
+explicit CPU/memory bounds reject an overcommitted plan before staging.
+Configurations are assigned deterministically, weighted by those slot counts.
+Each slot processes one configuration's workloads in order. Completed receipts
+commit in preplanned configuration/workload order regardless of completion order.
+
+The host-wide lock permits one coordinator. Screening may run its reserved
+slots concurrently, with one shared host phase deadline. Host-hours count elapsed
+host time once, not the sum of simultaneous job durations. Durable phase
+reservations charge an interrupted/crashed screening phase once, conservatively.
+Individual job timing and CPU use remain in the receipts. Screening timings are
+affected by CPU, memory and I/O contention and are diagnostic ranking inputs.
+
+All screening jobs drain on both hosts before finalist selection. Confirmation
+uses one job per host with the frozen matched thread counts for rars/native RAR
+encoding, integrity tests and extraction. It never overlaps its own screening
+or another confirmation on that host. Only complete isolated confirmation can
+qualify a finalist; requesting threads does not imply every encoder stage can
+use them. Resume retains verified completions and the frozen execution settings.
 
 Screening visits seeded whole-configuration workload blocks, keeping each configuration on one explicitly assigned host so a budget cutoff can yield complete candidates. It uses one sample for every configuration/workload it reaches. Only configurations
 with all applicable workloads verified can enter selection. Four-dimensional non-dominance
@@ -114,7 +149,7 @@ block counters and materialized temporary-output bytes have explicit scopes;
 I/O byte totals and cold-cache claims are unavailable by default. Successful extracted trees are removed only after durable, hash-bound member and verification receipts are saved. Archives, receipts and logs remain; failed extraction trees are preserved. Provide disk space for the retained archives. A nonzero exit, content/metadata mismatch, resource refusal or timeout
 retains its diagnostic files and excludes the affected candidate.
 
-Optional `--plan plan.json` accepts `worker_options` arrays (`rars_add`,
+Optional `--plan plan.json` accepts the execution settings above, `worker_options` arrays (`rars_add`,
 `native_add`, `rars_read`, `native_read`), a positive
 `task_timeout_seconds`, and reduced `budgets.screen`/`budgets.confirm` in seconds.
 Budgets cannot exceed the declared maxima. The six matrix switches cannot be

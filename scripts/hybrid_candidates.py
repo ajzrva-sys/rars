@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 
@@ -38,6 +39,7 @@ SCHEMA = 1
 BUDGETS = {"screen": 4 * 3600, "confirm": 12 * 3600}
 REPETITIONS = 15
 ROOT = Path(__file__).resolve().parents[1]
+EXECUTION_CONTEXT = threading.local()
 
 
 class RunError(Exception):
@@ -119,6 +121,27 @@ def configs(profiles):
             for profile in profiles for variant in range(64)]
 
 
+def execution_settings(value=None):
+    defaults = {"parallel_screening": False, "screen_threads": 1, "confirm_threads": 1}
+    if value is None:
+        return defaults
+    if not isinstance(value, dict) or set(value) - set(defaults):
+        raise RunError("unknown execution setting")
+    result = {**defaults, **value}
+    if not isinstance(result["parallel_screening"], bool):
+        raise RunError("parallel_screening must be a boolean")
+    for key in ("screen_threads", "confirm_threads"):
+        if isinstance(result[key], bool) or not isinstance(result[key], int) or not 1 <= result[key] <= 4096:
+            raise RunError("execution thread counts must be positive integers at most 4096")
+    return result
+
+
+def phase_threads(m, phase):
+    if phase not in BUDGETS:
+        raise RunError("unknown execution phase")
+    return execution_settings(m.get("execution"))[phase + "_threads"]
+
+
 def inventory(value=None):
     hosts = value or [{"id": "local", "kind": "local", "hostname": socket.gethostname()}]
     if not hosts or len({h.get("id") for h in hosts}) != len(hosts):
@@ -128,6 +151,11 @@ def inventory(value=None):
             raise RunError("host IDs may contain letters, digits, underscore and dash")
         if host.get("kind") not in ("local", "export", "ssh") or not host.get("hostname"):
             raise RunError("hosts require explicit hostname and kind local/export/ssh; no discovery")
+        for key in ("screening_slots", "logical_cpus", "memory_budget_bytes"):
+            if key in host and (isinstance(host[key], bool) or not isinstance(host[key], int) or host[key] <= 0):
+                raise RunError("host CPU slots and memory budgets must be positive integers")
+        if host.get("screening_slots", 1) > 4096:
+            raise RunError("screening_slots must be at most 4096")
         if host["kind"] == "ssh":
             if not re.fullmatch(r"[A-Za-z0-9_.@-]+", host.get("ssh_target", "")) or host["ssh_target"].startswith("-"):
                 raise RunError("SSH hosts require an explicit safe ssh_target")
@@ -202,6 +230,15 @@ def freeze(args):
     plan = read_json(args.plan) if args.plan else {}
     profiles = args.profile or ["desktop"]
     hosts = inventory(read_json(args.inventory) if args.inventory else None)
+    execution = execution_settings(plan.get("execution"))
+    for host in hosts:
+        slots = host.get("screening_slots", 1) if execution["parallel_screening"] else 1
+        if "logical_cpus" in host and max(slots * execution["screen_threads"], execution["confirm_threads"]) > host["logical_cpus"]:
+            raise RunError("execution exceeds the frozen host CPU allowance")
+        if "memory_budget_bytes" in host:
+            per_job = (8 * 1024**3 if "server" in profiles else 256 * 1024**2)
+            if slots * per_job > host["memory_budget_bytes"]:
+                raise RunError("screening slots exceed the frozen host managed-memory allowance")
     budgets = {name: float(plan.get("budgets", {}).get(name, default)) for name, default in BUDGETS.items()}
     if any(not math.isfinite(v) or v <= 0 or v > BUDGETS[k] for k, v in budgets.items()):
         raise RunError("budgets must be positive and at most four screen/twelve confirmation host-hours")
@@ -325,7 +362,7 @@ def freeze(args):
                     "invalid_combinations": invalid,
                     "seed": int(args.seed), "profiles": profiles,
                     "host_platform": {"system": platform.system(), "machine": platform.machine(), "python": platform.python_version(), "logical_cpus": os.cpu_count()}, "configurations": matrix,
-                    "cases": cases, "hosts": hosts, "budgets": budgets,
+                    "cases": cases, "hosts": hosts, "budgets": budgets, "execution": execution,
                     "cold_prepare": {"binary": "cold_prepare", "arguments": cold[1:]} if cold is not None else None,
                     "task_timeout_seconds": timeout, "worker_options": options,
                     "confirmation_repetitions": REPETITIONS, "max_finalists_per_profile": 3,
@@ -336,7 +373,7 @@ def freeze(args):
                     "corpus_manifest_sha256": sha(source), "corpus_source": str(source),
                     "runner_sha256": sha(runner), "metadata_scope": "all file/directory paths and types; regular bytes/SHA256 and explicitly requested member POSIX permissions/whole-second mtime; implicit parent directories path/type only; owner/group/xattrs/ACLs unmeasured",
                     "cold_scope": "operator-supplied cache preparation; system/global cache eviction is not verified" if cold is not None else "unavailable: no cache eviction performed; extraction measurements have uncontrolled cache state",
-                    "budget_scope": "aggregate wall-clock task reservations including correctness work; fixed equal per-host shares; interrupted tasks charge their entire reserved timeout",
+                    "budget_scope": "aggregate host wall time including correctness and scheduler work; fixed equal per-host shares; parallel screening charges each host phase once, interrupted phases conservatively charge one reserved host allowance" if execution["parallel_screening"] else "aggregate wall-clock task reservations including correctness work; fixed equal per-host shares; interrupted tasks charge their entire reserved timeout",
                     "rules": "No source mutation, build, AI invocation, auto-discovered SSH, byte-identity guard or size threshold. Only verified samples enter Pareto selection."}
         write_json(destination / "manifest.json", manifest)
         (destination / "manifest.sha256").write_text(sha(destination / "manifest.json") + "\n")
@@ -354,6 +391,8 @@ def load(run):
     if sha(run / "manifest.json") != (run / "manifest.sha256").read_text().strip():
         raise RunError("immutable manifest hash changed")
     m = read_json(run / "manifest.json")
+    execution_settings(m.get("execution"))
+    inventory(m["hosts"])
     if m["schema"] != SCHEMA or m["configurations"] != configs(m["profiles"]):
         raise RunError("configuration matrix is not the frozen six-bit 64-way matrix")
     if m["confirmation_repetitions"] != 15 or m["max_finalists_per_profile"] != 3:
@@ -413,6 +452,13 @@ def task_id(task):
 
 def host_for(m, task):
     # Keep one configuration's workload block and confirmation on one host.
+    if execution_settings(m.get("execution"))["parallel_screening"]:
+        weights = [host.get("screening_slots", 1) for host in m["hosts"]]
+        assigned = int(digest(task["configuration"]), 16) % sum(weights)
+        for host, weight in zip(m["hosts"], weights):
+            if assigned < weight:
+                return host["id"]
+            assigned -= weight
     return m["hosts"][int(digest(task["configuration"]), 16) % len(m["hosts"])]["id"]
 
 
@@ -442,10 +488,14 @@ def tasks(m, phase, finalists=None):
 def consumed(rows, phase, host):
     accounting = [r for r in rows if r.get("event") == "phase-accounting" and r["phase"] == phase and r["host"] == host]
     covered = {identifier for r in accounting for identifier in r["covered_tasks"]}
-    return sum(r["charged_seconds"] for r in accounting) + sum(
+    closed_reservations = {r.get("reservation_id") for r in accounting}
+    outstanding = sum(r["reserved_seconds"] for r in rows
+                      if r.get("event") == "phase-reservation" and r["phase"] == phase and r["host"] == host
+                      and r["id"] not in closed_reservations)
+    return outstanding + sum(r["charged_seconds"] for r in accounting) + sum(
         row.get("charged_seconds", row.get("reserved_seconds", 0))
         for identifier, row in latest(rows).items() if identifier not in covered
-        and row["task"]["phase"] == phase and row["host"] == host)
+        and not row.get("phase_reservation") and row["task"]["phase"] == phase and row["host"] == host)
 
 
 def available(m, rows, phase, host):
@@ -464,6 +514,9 @@ def execute(command, cwd, area, label, deadline, environment):
         timed_out = False
         try:
             while True:
+                cancellation = getattr(EXECUTION_CONTEXT, "cancellation", None)
+                if cancellation is not None and cancellation.is_set():
+                    raise RunError("parallel screening cancelled")
                 pid, status, usage = os.wait4(process.pid, os.WNOHANG)
                 if pid:
                     break
@@ -523,17 +576,18 @@ def control_settings(profile, case):
             "memory_limit_bytes": (256 * 1024**2 if profile == "desktop" else 8 * 1024**3)}
 
 
-def compression_command(m, run, role, configuration, case, archive, member_order=None):
+def compression_command(m, run, role, configuration, case, archive, member_order=None, phase="screen"):
     binary_role = "native" if role == "native_ordered" else (role if role in m["binaries"] else "candidate")
     binary = str(run / m["binaries"][binary_role]["path"])
     opts = m["worker_options"]
     settings = control_settings(configuration["profile"], case)
+    threads = phase_threads(m, phase)
     if role in ("native", "native_ordered"):
-        return [binary, "a", "-idq", "-y", "-ma5", "-m3", f'-md{settings["dictionary_bytes"] // 1024}k', "-mt1",
+        return [binary, "a", "-idq", "-y", "-ma5", "-m3", f'-md{settings["dictionary_bytes"] // 1024}k', f"-mt{threads}",
                 "-s" if case["solid"] else "-s-", *(["-ds", "-r-"] if role == "native_ordered" else []),
                 *opts.get("native_add", []), str(archive), *(member_order if member_order is not None else case["archive_members"])]
     variant = configuration["variant"] & 15 if role == "streams" else configuration["variant"]
-    result = [binary, "--threads", "1", "--progress", "never", "a", "--format", "rar50", "--level", "3",
+    result = [binary, "--threads", str(threads), "--progress", "never", "a", "--format", "rar50", "--level", "3",
               "--memory-limit", str(settings["memory_limit_bytes"]), "--max-memory", str(settings["memory_limit_bytes"])]
     if role == "baseline":
         result.extend(["--dict-size", str(settings["dictionary_bytes"])])
@@ -575,6 +629,9 @@ def sample(run, m, task, deadline):
                        "load_before": os.getloadavg() if hasattr(os, "getloadavg") else None},
               "metadata_scope": m["metadata_scope"],
               "cold_scope": m["cold_scope"], "cold_extraction": None}
+    parallel = task["phase"] == "screen" and execution_settings(m.get("execution"))["parallel_screening"]
+    result["execution"] = {"threads": phase_threads(m, task["phase"]),
+                           "measurement_scope": "contention-affected screening diagnostics" if parallel else "exclusive confirmation" if task["phase"] == "confirm" else "serial screening diagnostics"}
     env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
     # Disable ambient knobs that would silently alter the frozen experiment.
     for key in list(env):
@@ -612,7 +669,9 @@ def archive_order(run, m, archive, area, label, case, deadline, environment):
 
 def run_role(run, m, task, configuration, case, area, deadline, env, result, role, member_order=None):
     archive = area / (role + ".rar")
-    encoded = execute(compression_command(m, run, role, configuration, case, archive, member_order),
+    phase = task.get("phase", "screen")
+    threads = phase_threads(m, phase)
+    encoded = execute(compression_command(m, run, role, configuration, case, archive, member_order, phase),
                           run / case["input_path"], area, role + "-encode", deadline, env)
     data = {"encode": encoded, "archive_bytes": archive.stat().st_size,
             "archive_sha256": sha(archive, deadline), "decoders": {}}
@@ -628,9 +687,9 @@ def run_role(run, m, task, configuration, case, area, deadline, env, result, rol
         target.mkdir()
         native = decoder == "native"
         extra = m["worker_options"].get("native_read" if native else "rars_read", [])
-        test = [binary, "t", "-idq", "-p-", *extra, str(archive)] if native else [binary, "--threads", "1", "test", *extra, str(archive)]
+        test = [binary, "t", "-idq", "-p-", f"-mt{threads}", *extra, str(archive)] if native else [binary, "--threads", str(threads), "test", *extra, str(archive)]
         execute(test, area, area, role + "-" + decoder + "-integrity", deadline, env)
-        command = [binary, "x", "-idq", "-y", "-p-", *extra, str(archive), str(target) + "/"] if native else [binary, "--threads", "1", "extract", *extra, str(archive), str(target)]
+        command = [binary, "x", "-idq", "-y", "-p-", f"-mt{threads}", *extra, str(archive), str(target) + "/"] if native else [binary, "--threads", str(threads), "extract", *extra, str(archive), str(target)]
         decoded = execute(command, area, area, role + "-" + decoder + "-extract", deadline, env)
         tree = snapshot_tree(target, deadline)
         validate_tree(tree, case["members"])
@@ -655,7 +714,7 @@ def run_role(run, m, task, configuration, case, area, deadline, env, result, rol
         data["temporary_io_scope"] += "; includes the additional verified selective tree; helper I/O is not inferred"
 
 
-def cold_selective(run, m, task, case, area, archive, role, archive_sha256, deadline, environment):
+def cold_selective(run, m, task, case, area, archive, role, archive_sha256, deadline, environment, phase=None):
     preparation = m.get("cold_prepare")
     if preparation is None:
         return None
@@ -673,7 +732,8 @@ def cold_selective(run, m, task, case, area, archive, role, archive_sha256, dead
     target = area / (role + "-cold-selective")
     target.mkdir()
     native = str(run / m["binaries"]["native"]["path"])
-    extraction = execute([native, "x", "-idq", "-y", "-p-", *m["worker_options"].get("native_read", []),
+    threads = phase_threads(m, phase or task.get("phase", "screen"))
+    extraction = execute([native, "x", "-idq", "-y", "-p-", f"-mt{threads}", *m["worker_options"].get("native_read", []),
                           str(archive), selected, str(target) + "/"],
                          area, area, role + "-cold-selective-extract", deadline, environment)
     actual = snapshot_tree(target, deadline)
@@ -788,7 +848,138 @@ def choose_finalists(run, m, rows):
         selected.extend(promoted)
     return {"manifest_sha256": sha(run / "manifest.json"), "finalists": selected,
             "screen_metrics": eligible, "eligible_configurations": len(eligible), "unranked": unranked, "coverage": coverage,
+            "measurement_scope": "Screening is diagnostic under CPU/memory/I/O contention; performance qualification requires exclusive confirmation." if execution_settings(m.get("execution"))["parallel_screening"] else "Serial screening; performance qualification requires confirmation.",
             "rule": "four-dimensional non-dominance of within-host/task candidate/native ratios (encode wall, archive bytes, encode RSS, rars extraction wall); compare and sum-log rank only identical valid-workload signatures, then round-robin groups by descending coverage and stable signature; at most three per profile; equal workload weight"}
+
+
+def parallel_screen(run, m, host, max_tasks=None):
+    """Run complete configuration blocks concurrently; commit outcomes in plan order.
+
+    The durable phase reservation accounts for host wall time once, rather than
+    multiplying the budget by the number of simultaneous diagnostic samples.
+    """
+    host_id = host["id"]
+    slots = host["screening_slots"]
+    cancelled = threading.Event()
+    started_at = time.monotonic()
+    attempted = []
+    with locked(run / "journal.lock"):
+        rows = journal(run)
+        allowance = available(m, rows, "screen", host_id)
+        if allowance <= 0:
+            return {"tasks_run": 0, "paused": False}
+        previous = latest(rows)
+        failed = {r["task"]["configuration"] for r in previous.values() if r["event"] == "failed"}
+        invalid = {(r["configuration"], r["case"]): r for r in m.get("invalid_combinations", [])}
+        blocks = []
+        planned_count = 0
+        for task in tasks(m, "screen"):
+            if host_for(m, task) != host_id or task_id(task) in previous:
+                continue
+            refusal = invalid.get((task["configuration"], task["case"]))
+            if refusal is not None or task["configuration"] in failed:
+                append(run, {"event": "excluded", "task": task, "task_id": task_id(task), "host": host_id,
+                             "charged_seconds": 0,
+                             **({"pre_dispatch": True, **refusal} if refusal is not None else
+                                {"reason": "configuration has a failed screening sample"})})
+                continue
+            if max_tasks is not None and planned_count >= max_tasks:
+                continue
+            if not blocks or blocks[-1][0]["configuration"] != task["configuration"]:
+                blocks.append([])
+            blocks[-1].append(task)
+            planned_count += 1
+        if not blocks:
+            return {"tasks_run": 0, "paused": False}
+        reservation_id = uuid.uuid4().hex
+        phase_deadline = started_at + allowance
+        append(run, {"event": "phase-reservation", "id": reservation_id, "phase": "screen", "host": host_id,
+                     "reserved_seconds": allowance, "screening_slots": slots,
+                     "accounting_scope": "host wall time once; concurrent samples are diagnostic"})
+        append(run, {"event": "dispatch-plan", "phase": "screen", "host": host_id,
+                     "phase_reservation": reservation_id, "screening_slots": slots,
+                     "configuration_blocks": [[task_id(task) for task in block] for block in blocks]})
+    manifest_sha = sha(run / "manifest.json")
+
+    buffered_outcomes = [[] for _ in blocks]
+
+    def run_block(index, block):
+        EXECUTION_CONTEXT.cancellation = cancelled
+        outcomes = buffered_outcomes[index]
+        failed_configuration = False
+        try:
+            for task in block:
+                if failed_configuration:
+                    outcomes.append({"event": "excluded", "task": task, "task_id": task_id(task), "host": host_id,
+                                     "charged_seconds": 0, "phase_reservation": reservation_id,
+                                     "reason": "configuration has a failed screening sample"})
+                    continue
+                if cancelled.is_set() or time.monotonic() >= phase_deadline:
+                    break
+                begin = time.monotonic()
+                deadline = min(begin + m["task_timeout_seconds"], phase_deadline)
+                started = {"event": "started", "task": task, "task_id": task_id(task), "host": host_id,
+                           "reserved_seconds": deadline - begin, "manifest_sha256": manifest_sha,
+                           "phase_reservation": reservation_id, "contended": True,
+                           "screening_slots": slots}
+                with locked(run / "journal.lock"):
+                    append(run, started)
+                    attempted.append(task_id(task))
+                try:
+                    sample(run, m, task, deadline)
+                    path = run / "tasks" / task_id(task) / "result.json"
+                    completed = {**started, "event": "complete", "result": str(path.relative_to(run)),
+                                 "result_sha256": sha(path, deadline)}
+                except (RunError, OSError) as error:
+                    completed = {**started, "event": "failed", "error": str(error),
+                                 "control_failure": bool(getattr(error, "control_failure", False))}
+                completed["charged_seconds"] = time.monotonic() - begin
+                completed["charge_scope"] = "diagnostic job timing; host phase accounts budget"
+                outcomes.append(completed)
+                failed_configuration = completed["event"] == "failed"
+                if completed.get("control_failure"):
+                    cancelled.set()
+                    break
+            return outcomes
+        finally:
+            del EXECUTION_CONTEXT.cancellation
+
+    count = 0
+    interrupted = True
+    control_error = None
+    pool = ThreadPoolExecutor(max_workers=slots)
+    try:
+        futures = [pool.submit(run_block, index, block) for index, block in enumerate(blocks)]
+        for future in futures:
+            outcomes = future.result()
+            with locked(run / "journal.lock"):
+                for outcome in outcomes:
+                    append(run, outcome)
+                    if outcome["event"] != "excluded":
+                        count += 1
+                    if outcome.get("control_failure") and control_error is None:
+                        control_error = outcome["error"]
+        interrupted = False
+    finally:
+        cancelled.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+        with locked(run / "journal.lock"):
+            states = latest(journal(run))
+            for outcomes in buffered_outcomes:
+                for outcome in outcomes:
+                    if states.get(outcome["task_id"], {}).get("event") in (None, "started"):
+                        append(run, outcome)
+                        states[outcome["task_id"]] = outcome
+            elapsed = time.monotonic() - started_at
+            attempted_ids = set(attempted)
+            append(run, {"event": "phase-accounting", "id": uuid.uuid4().hex, "phase": "screen", "host": host_id,
+                         "reservation_id": reservation_id,
+                         "covered_tasks": [task_id(task) for block in blocks for task in block if task_id(task) in attempted_ids],
+                         "charged_seconds": max(elapsed, allowance) if interrupted else elapsed,
+                         "interrupted": interrupted, "accounting_scope": "host wall time once"})
+    if control_error is not None:
+        raise RunError("control failed; run stopped, receipt retained: " + control_error)
+    return {"tasks_run": count, "paused": max_tasks is not None and planned_count >= max_tasks}
 
 
 def worker(run, host_id, max_tasks=None):
@@ -803,6 +994,15 @@ def worker(run, host_id, max_tasks=None):
         if any(r.get("control_failure") for r in journal(run)):
             raise RunError("a retained control failure blocks this run; use a new frozen run after repairing its cause")
         for phase in ("screen", "confirm"):
+            if phase == "screen" and m.get("execution", {}).get("parallel_screening") and host.get("screening_slots", 1) > 1:
+                result = parallel_screen(run, m, host, None if max_tasks is None else max_tasks - count)
+                count += result["tasks_run"]
+                if result["paused"]:
+                    return {"status": "paused-at-task-boundary", "tasks_run": count}
+                with locked(run / "journal.lock"):
+                    if not any(r.get("event") == "phase-done" and r.get("phase") == phase and r.get("host") == host_id for r in journal(run)):
+                        append(run, {"event": "phase-done", "phase": phase, "host": host_id})
+                continue
             phase_start = time.monotonic()
             starting_charge = consumed(journal(run), phase, host_id)
             phase_deadline = phase_start + max(0, m["budgets"][phase] / len(m["hosts"]) - starting_charge)
@@ -920,12 +1120,12 @@ def report(run):
     m = load(run)
     rows = journal(run)
     events = list(latest(rows).values())
-    result = {"manifest_sha256": sha(run / "manifest.json"), "tasks": {name: sum(x["event"] == name for x in events) for name in ("started", "complete", "failed", "excluded")},
+    result = {"manifest_sha256": sha(run / "manifest.json"), "execution": execution_settings(m.get("execution")), "tasks": {name: sum(x["event"] == name for x in events) for name in ("started", "complete", "failed", "excluded")},
               "budget_seconds": {phase: {h["id"]: {"charged": consumed(rows, phase, h["id"]), "remaining": available(m, rows, phase, h["id"])} for h in m["hosts"]} for phase in BUDGETS},
               "selection": read_json(run / "selection.json") if (run / "selection.json").exists() else None,
               "predeclared_invalid_combinations": m.get("invalid_combinations", []),
               "absolute_screen_frontiers": absolute_frontiers(verified_results(run, rows, "screen")),
-              "scope": "Partial runs and failed/incomplete confirmations are not qualified finalists. No byte identity, size percentage or native-parity acceptance is inferred."}
+              "scope": "Parallel screening timings are contention affected diagnostics. Only serial, exclusive confirmation can qualify finalists. Partial runs and failed/incomplete confirmations are not qualified. No byte identity, size percentage or native-parity acceptance is inferred."}
     confirmations = verified_results(run, rows, "confirm")
     grouped = {}
     for item in confirmations:
