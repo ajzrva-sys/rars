@@ -1,0 +1,110 @@
+{
+  "generator": "temple-anchor-comparison-v2; reuse committed hybrid-fixtures-v1/xorshift64",
+  "fixture_generator_sha256": "02477c86de136d4c9a9eabb2839f08c69bf3a6d55859b523d9c854bfa48c720e",
+  "source_fixture_revision": "e490bf558e98a4438d3e0990159c22dfd076611b",
+  "source_fixture_parts": [
+    {
+      "path": "crates/rars/src/codec/match_finder.rs",
+      "sha256": "c13a39b3b4ecf283a1c95b634f6ad8c6104a4cab4163106a79833dccd0e72436"
+    },
+    {
+      "path": "crates/rars/src/codec/rar50/encoder.rs",
+      "sha256": "332a1d7ebb24a1f3dc0fdcb84520ad647d522a2336cb15339262406510ee5f29"
+    }
+  ],
+  "metadata": {
+    "file_mode": "0644",
+    "mtime_seconds": 1700000000,
+    "directory_arguments": false
+  },
+  "mechanistic_stress_case": {
+    "file": "hot-prefix-pressure.bin",
+    "bytes": 196608,
+    "block_bytes": 256,
+    "block_prefix_hex": "414e4348",
+    "tail_seed_base": "0xAC000001",
+    "copied_source_offset": 0,
+    "copied_bytes": 1024,
+    "copy_offsets": [
+      66048,
+      140288
+    ],
+    "purpose": "one declared collision-pressure case tests retention beyond the 64 KiB recent index; it is not representative workload evidence"
+  },
+  "files": [
+    {
+      "path": "source-and-logs.txt",
+      "size": 262144,
+      "sha256": "69fcc14a780a35a9b6de81b4ab0423520515980dbc9d9c397a4985595be6d4bc"
+    },
+    {
+      "path": "related-releases.jsonl",
+      "size": 29423,
+      "sha256": "c964bb8717a7f9b490a3dd9b633db8b0d9f6e59a20f8cb06dd14d7ff50c7d24c"
+    },
+    {
+      "path": "shifted-repeat.bin",
+      "size": 16641,
+      "sha256": "862d0c331b35a07419f44b034e69336292b67a07f326a73d20bcda6e1cdddaf1"
+    },
+    {
+      "path": "dictionary-distance.bin",
+      "size": 180224,
+      "sha256": "6dd7bede46ce8a3b42c8019ad09a05b97fd77bbe9f8ecf10a44f278a9dea76c4"
+    },
+    {
+      "path": "unrelated-data.bin",
+      "size": 24576,
+      "sha256": "be7c7a2485db834cd7ed0de1a9ec06ca299e22959636d726e361681b1d9c5264"
+    },
+    {
+      "path": "hot-prefix-pressure.bin",
+      "size": 196608,
+      "sha256": "989d749ecdc057aa1a7e2bd8b6db71b0aa9e2a63808ad912f2b83b3ff8856851"
+    }
+  ],
+  "workloads": [
+    {
+      "id": "source-and-logs",
+      "files": [
+        "source-and-logs.txt"
+      ],
+      "solid": false
+    },
+    {
+      "id": "related-releases",
+      "files": [
+        "related-releases.jsonl"
+      ],
+      "solid": false
+    },
+    {
+      "id": "shifted-repeat",
+      "files": [
+        "shifted-repeat.bin"
+      ],
+      "solid": false
+    },
+    {
+      "id": "dictionary-distance",
+      "files": [
+        "dictionary-distance.bin"
+      ],
+      "solid": false
+    },
+    {
+      "id": "unrelated-data",
+      "files": [
+        "unrelated-data.bin"
+      ],
+      "solid": false
+    },
+    {
+      "id": "hot-prefix-pressure",
+      "files": [
+        "hot-prefix-pressure.bin"
+      ],
+      "solid": false
+    }
+  ]
+}

@@ -1,0 +1,846 @@
+{
+  "settings": {
+    "dictionary_bytes": 4194304,
+    "rars_level": 3,
+    "threads": 1,
+    "rars_filters": "--no-filter",
+    "native_modes": "-mc-",
+    "paired_repetitions_per_workload": 15,
+    "workloads": 6,
+    "total_input_bytes": 709616
+  },
+  "encoder_builds": {
+    "revision": "967c539f7bc8f4da74b4c4cc6bea0dca1d295d36",
+    "tree": "8a9895e47ae9d014629dce3caef50c22d04f73b5",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "builds": [
+      {
+        "label": "current",
+        "feature": null,
+        "source_revision": "d4664689177ad50c5b94906e882e4a36fd3aca8f",
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "--locked",
+          "-p",
+          "rars-cli"
+        ],
+        "sha256": "6c6a5ef616f69bb428933f1a6d42a86a2434d09477ec6339b12cbe8cdcf938dd",
+        "bytes": 6350808
+      },
+      {
+        "label": "default-featureless-equivalence",
+        "feature": null,
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "--locked",
+          "-p",
+          "rars-cli"
+        ],
+        "sha256": "7519ac68088450341805e1c2605d566ccc67659258972c20b7b19051bdbfa79f",
+        "bytes": 6348136,
+        "source_revision": "38355068b548fcc9d730a2ea90b19c1200f5fee8"
+      },
+      {
+        "label": "cyclic",
+        "feature": "experimental-anchor-cyclic",
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "--locked",
+          "-p",
+          "rars-cli",
+          "--features",
+          "experimental-anchor-cyclic"
+        ],
+        "sha256": "ac7a3a398f500a3bb79fad82d3ee3bd5b1867e92341a3fdd33770fce6649afaa",
+        "bytes": 6372776,
+        "source_revision": "967c539f7bc8f4da74b4c4cc6bea0dca1d295d36"
+      },
+      {
+        "label": "useful",
+        "feature": "experimental-anchor-useful",
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "--locked",
+          "-p",
+          "rars-cli",
+          "--features",
+          "experimental-anchor-useful"
+        ],
+        "sha256": "52322d1eb29d523afe8ea6cdcfa8b9f8b0127af62d42acec2e13301d5787930d",
+        "bytes": 6372760,
+        "source_revision": "967c539f7bc8f4da74b4c4cc6bea0dca1d295d36"
+      }
+    ]
+  },
+  "runner": {
+    "revision": "5dc3301d603a11ed4bc8267c3867275eb8a672cd",
+    "files": {
+      "hybrid_candidates.py": "866235a79a0b6e0bde6873efcb17613219a4736c5e74913c26b1611bd880771d",
+      "hybrid_fixtures.py": "02477c86de136d4c9a9eabb2839f08c69bf3a6d55859b523d9c854bfa48c720e"
+    }
+  },
+  "native_smoke": {
+    "cases": 36,
+    "result": "pass",
+    "formats": [
+      "RAR5",
+      "RAR7"
+    ],
+    "parsers": [
+      "lazy",
+      "optimal"
+    ],
+    "explicit_delta_filter": true,
+    "solid_history": true,
+    "rar7_fractional_dictionary": true
+  },
+  "variants": {
+    "cyclic": {
+      "source_revision": "967c539f7bc8f4da74b4c4cc6bea0dca1d295d36",
+      "manifest_sha256": "a9c1786f8f493812d7c9a38dd0d441ec8b9b05ecbb2dd924f51fa4b93ee1bbf9",
+      "workloads": {
+        "source-and-logs": {
+          "candidate": {
+            "archive_bytes": 35468,
+            "encode_wall_seconds": 0.18660083299999997,
+            "encode_cpu_seconds": 0.170107,
+            "encode_peak_rss_bytes": 10928128,
+            "native_decode_wall_seconds": 0.01391525000000371,
+            "native_decode_peak_rss_bytes": 2375680,
+            "rars_decode_wall_seconds": 0.013942499999998859,
+            "rars_decode_peak_rss_bytes": 4292608
+          },
+          "baseline": {
+            "archive_bytes": 35101,
+            "encode_wall_seconds": 0.16068608299999987,
+            "encode_cpu_seconds": 0.14648999999999998,
+            "encode_peak_rss_bytes": 11173888,
+            "native_decode_wall_seconds": 0.01288729100000019,
+            "native_decode_peak_rss_bytes": 2375680,
+            "rars_decode_wall_seconds": 0.014189166999997838,
+            "rars_decode_peak_rss_bytes": 4292608
+          },
+          "native": {
+            "archive_bytes": 38718,
+            "encode_wall_seconds": 0.013901457999999423,
+            "encode_cpu_seconds": 0.009155,
+            "encode_peak_rss_bytes": 18366464,
+            "native_decode_wall_seconds": 0.013770499999999686,
+            "native_decode_peak_rss_bytes": 2375680,
+            "rars_decode_wall_seconds": 0.013956166999999908,
+            "rars_decode_peak_rss_bytes": 4259840
+          },
+          "paired_wall_median_ratio": 1.1783128614590408,
+          "paired_wall_median_bootstrap_95pct": [
+            1.1364592516689418,
+            1.2233026519196661
+          ],
+          "paired_wall_ratios": [
+            1.206730329943251,
+            1.1223695968833458,
+            1.2844864251729045,
+            1.1951123419143097,
+            1.1545155656075083,
+            1.0776464728474222,
+            1.151669701358813,
+            1.1364592516689418,
+            1.2233026519196661,
+            1.1315167144581035,
+            1.2247561659242807,
+            1.1783128614590408,
+            1.2552997920396285,
+            1.2109471160712488,
+            1.137455660685858
+          ],
+          "paired_peak_rss_median_ratio": 0.9780380673499268,
+          "archive_size_ratio": 1.0104555425771347,
+          "deterministic_candidate_archive_sha256": "0eec9745049049ee24047ea71f6e03476d64f329926666b32dc4af8b603aae7d"
+        },
+        "related-releases": {
+          "candidate": {
+            "archive_bytes": 1404,
+            "encode_wall_seconds": 0.02587216699999928,
+            "encode_cpu_seconds": 0.011337999999999999,
+            "encode_peak_rss_bytes": 6356992,
+            "native_decode_wall_seconds": 0.013967375000000004,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.01420162499999833,
+            "rars_decode_peak_rss_bytes": 3637248
+          },
+          "baseline": {
+            "archive_bytes": 1403,
+            "encode_wall_seconds": 0.026693083000001394,
+            "encode_cpu_seconds": 0.008254,
+            "encode_peak_rss_bytes": 6340608,
+            "native_decode_wall_seconds": 0.014323833999998925,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.013061999999999685,
+            "rars_decode_peak_rss_bytes": 3653632
+          },
+          "native": {
+            "archive_bytes": 1628,
+            "encode_wall_seconds": 0.014334791000001346,
+            "encode_cpu_seconds": 0.0043749999999999995,
+            "encode_peak_rss_bytes": 9601024,
+            "native_decode_wall_seconds": 0.014007207999998883,
+            "native_decode_peak_rss_bytes": 2129920,
+            "rars_decode_wall_seconds": 0.0141143750000019,
+            "rars_decode_peak_rss_bytes": 3637248
+          },
+          "paired_wall_median_ratio": 0.9848154607546984,
+          "paired_wall_median_bootstrap_95pct": [
+            0.9262156558324774,
+            1.0765309631227893
+          ],
+          "paired_wall_ratios": [
+            1.7539603078793886,
+            0.9265267614591366,
+            0.918795344629839,
+            1.0718125137212533,
+            1.086505463452748,
+            0.8475835950389128,
+            0.9966585419839521,
+            1.0765309631227893,
+            1.0815919291971061,
+            0.9234691882909812,
+            0.974595131107279,
+            0.9848154607546984,
+            0.9483184089300559,
+            0.9262156558324774,
+            1.0591175683241167
+          ],
+          "paired_peak_rss_median_ratio": 1.0,
+          "archive_size_ratio": 1.000712758374911,
+          "deterministic_candidate_archive_sha256": "7789aacba7f58b352dc5e98ccf2f2b30b954a043a467b7e1d3dc196739a9032f"
+        },
+        "shifted-repeat": {
+          "candidate": {
+            "archive_bytes": 8650,
+            "encode_wall_seconds": 0.014231124999998457,
+            "encode_cpu_seconds": 0.004203999999999999,
+            "encode_peak_rss_bytes": 6651904,
+            "native_decode_wall_seconds": 0.01399174999999886,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.014421999999999713,
+            "rars_decode_peak_rss_bytes": 3653632
+          },
+          "baseline": {
+            "archive_bytes": 8650,
+            "encode_wall_seconds": 0.014357375000003003,
+            "encode_cpu_seconds": 0.003926,
+            "encode_peak_rss_bytes": 6520832,
+            "native_decode_wall_seconds": 0.014124458000000395,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.014371958000001683,
+            "rars_decode_peak_rss_bytes": 3637248
+          },
+          "native": {
+            "archive_bytes": 8671,
+            "encode_wall_seconds": 0.014500707999999918,
+            "encode_cpu_seconds": 0.0048590000000000005,
+            "encode_peak_rss_bytes": 9682944,
+            "native_decode_wall_seconds": 0.014157208999999504,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.01440233400000146,
+            "rars_decode_peak_rss_bytes": 3653632
+          },
+          "paired_wall_median_ratio": 0.9810378149553942,
+          "paired_wall_median_bootstrap_95pct": [
+            0.9283556704120397,
+            1.0195423730925413
+          ],
+          "paired_wall_ratios": [
+            0.9968650828100762,
+            0.9696473291761153,
+            0.8523521417526354,
+            1.141060801028507,
+            0.9419132816698179,
+            0.9283556704120397,
+            0.6061054020737222,
+            1.0195423730925413,
+            1.1895286787904278,
+            0.9810378149553942,
+            1.0033197427733602,
+            0.6090694374823996,
+            1.1697230824553742,
+            1.0428275997826295,
+            0.8594247903947955
+          ],
+          "paired_peak_rss_median_ratio": 1.0174563591022443,
+          "archive_size_ratio": 1.0,
+          "deterministic_candidate_archive_sha256": "c8a5d9b95fb146541c56f701b173294613629c63fc84ff97a098cb55ba19f40b"
+        },
+        "dictionary-distance": {
+          "candidate": {
+            "archive_bytes": 172332,
+            "encode_wall_seconds": 0.02703304199999934,
+            "encode_cpu_seconds": 0.016646,
+            "encode_peak_rss_bytes": 16400384,
+            "native_decode_wall_seconds": 0.014171042000000966,
+            "native_decode_peak_rss_bytes": 2293760,
+            "rars_decode_wall_seconds": 0.014331499999999942,
+            "rars_decode_peak_rss_bytes": 4194304
+          },
+          "baseline": {
+            "archive_bytes": 172331,
+            "encode_wall_seconds": 0.0267217500000001,
+            "encode_cpu_seconds": 0.014105,
+            "encode_peak_rss_bytes": 16203776,
+            "native_decode_wall_seconds": 0.014159499999998104,
+            "native_decode_peak_rss_bytes": 2293760,
+            "rars_decode_wall_seconds": 0.014001500000002665,
+            "rars_decode_peak_rss_bytes": 4210688
+          },
+          "native": {
+            "archive_bytes": 172648,
+            "encode_wall_seconds": 0.014339750000000429,
+            "encode_cpu_seconds": 0.008721999999999999,
+            "encode_peak_rss_bytes": 16220160,
+            "native_decode_wall_seconds": 0.013977291999999863,
+            "native_decode_peak_rss_bytes": 2293760,
+            "rars_decode_wall_seconds": 0.013976083000002859,
+            "rars_decode_peak_rss_bytes": 4276224
+          },
+          "paired_wall_median_ratio": 1.0731739237586015,
+          "paired_wall_median_bootstrap_95pct": [
+            0.9886540519200571,
+            1.3880814288280738
+          ],
+          "paired_wall_ratios": [
+            1.0090709725665399,
+            1.3880814288280738,
+            1.0731739237586015,
+            0.930264335232504,
+            1.4963546029087094,
+            1.0738403786936928,
+            0.9709825723466172,
+            1.0423365581448698,
+            0.9886540519200571,
+            1.3719003390002122,
+            1.0984150689649275,
+            1.389350044207434,
+            1.8677190018512666,
+            0.9870801980873902,
+            0.8989960807820713
+          ],
+          "paired_peak_rss_median_ratio": 1.012133468149646,
+          "archive_size_ratio": 1.000005802786498,
+          "deterministic_candidate_archive_sha256": "446fad78c3d83c94e88a83aa03ca568eabd6e4e0d15db40fb66132ee16dcf2c3"
+        },
+        "unrelated-data": {
+          "candidate": {
+            "archive_bytes": 24733,
+            "encode_wall_seconds": 0.014868792000001463,
+            "encode_cpu_seconds": 0.005386999999999999,
+            "encode_peak_rss_bytes": 8617984,
+            "native_decode_wall_seconds": 0.014391500000002111,
+            "native_decode_peak_rss_bytes": 6307840,
+            "rars_decode_wall_seconds": 0.014221917000000417,
+            "rars_decode_peak_rss_bytes": 3457024
+          },
+          "baseline": {
+            "archive_bytes": 24733,
+            "encode_wall_seconds": 0.014705209000002384,
+            "encode_cpu_seconds": 0.005134,
+            "encode_peak_rss_bytes": 8552448,
+            "native_decode_wall_seconds": 0.01417899999999861,
+            "native_decode_peak_rss_bytes": 6307840,
+            "rars_decode_wall_seconds": 0.01432541699999934,
+            "rars_decode_peak_rss_bytes": 3457024
+          },
+          "native": {
+            "archive_bytes": 24731,
+            "encode_wall_seconds": 0.014386957999999339,
+            "encode_cpu_seconds": 0.005358999999999999,
+            "encode_peak_rss_bytes": 10010624,
+            "native_decode_wall_seconds": 0.014474916999999365,
+            "native_decode_peak_rss_bytes": 6307840,
+            "rars_decode_wall_seconds": 0.014273834000000818,
+            "rars_decode_peak_rss_bytes": 3457024
+          },
+          "paired_wall_median_ratio": 0.9896345653553874,
+          "paired_wall_median_bootstrap_95pct": [
+            0.8847431546194495,
+            1.0239979928792466
+          ],
+          "paired_wall_ratios": [
+            0.9205203920058564,
+            1.8965864693965444,
+            0.9896345653553874,
+            1.0059900386998644,
+            0.5239029283680628,
+            0.9027697617649773,
+            0.8847431546194495,
+            0.6175309511590664,
+            1.851142509274046,
+            1.003130261736481,
+            1.0239979928792466,
+            0.6392613233953307,
+            0.9420135964419185,
+            1.7244213920899782,
+            1.0303458383500115
+          ],
+          "paired_peak_rss_median_ratio": 1.0076628352490422,
+          "archive_size_ratio": 1.0,
+          "deterministic_candidate_archive_sha256": "3d229dba0ebaea9f7899b08cde8af2c54b5dbc35586b4d7d82e261b0df4510f0"
+        },
+        "hot-prefix-pressure": {
+          "candidate": {
+            "archive_bytes": 193803,
+            "encode_wall_seconds": 0.03493054100000137,
+            "encode_cpu_seconds": 0.018456,
+            "encode_peak_rss_bytes": 16564224,
+            "native_decode_wall_seconds": 0.013868750000000318,
+            "native_decode_peak_rss_bytes": 2310144,
+            "rars_decode_wall_seconds": 0.014172750000000178,
+            "rars_decode_peak_rss_bytes": 4243456
+          },
+          "baseline": {
+            "archive_bytes": 192801,
+            "encode_wall_seconds": 0.026999249999999364,
+            "encode_cpu_seconds": 0.015863,
+            "encode_peak_rss_bytes": 16220160,
+            "native_decode_wall_seconds": 0.0139260830000012,
+            "native_decode_peak_rss_bytes": 2310144,
+            "rars_decode_wall_seconds": 0.01416941599999788,
+            "rars_decode_peak_rss_bytes": 4259840
+          },
+          "native": {
+            "archive_bytes": 193708,
+            "encode_wall_seconds": 0.014410832999999457,
+            "encode_cpu_seconds": 0.009297,
+            "encode_peak_rss_bytes": 16334848,
+            "native_decode_wall_seconds": 0.014133292000000353,
+            "native_decode_peak_rss_bytes": 2310144,
+            "rars_decode_wall_seconds": 0.0140009579999969,
+            "rars_decode_peak_rss_bytes": 4358144
+          },
+          "paired_wall_median_ratio": 1.0262908834063915,
+          "paired_wall_median_bootstrap_95pct": [
+            0.982754462626499,
+            1.451351629727434
+          ],
+          "paired_wall_ratios": [
+            1.0491591026311105,
+            1.0604748109516693,
+            1.0060981584214639,
+            0.982754462626499,
+            1.451351629727434,
+            1.4935463431727745,
+            0.9673808388618153,
+            0.6918620243698368,
+            1.4947374834486744,
+            1.0262908834063915,
+            1.3445510573903965,
+            0.9991232406517911,
+            0.9818690927470196,
+            0.9758445580686054,
+            1.7027269965308638
+          ],
+          "paired_peak_rss_median_ratio": 1.0211907164480323,
+          "archive_size_ratio": 1.0051970684799352,
+          "deterministic_candidate_archive_sha256": "50ac139f6381137b7bc56dbdbcf08be8ed8a482ca34f44d0f54bac9dac8c51a7"
+        }
+      }
+    },
+    "useful": {
+      "source_revision": "967c539f7bc8f4da74b4c4cc6bea0dca1d295d36",
+      "manifest_sha256": "93306dc29dbedbec794a1a5ebb13fa02cf3d72aabaf971b8c23a9b351473ecd6",
+      "workloads": {
+        "source-and-logs": {
+          "candidate": {
+            "archive_bytes": 35473,
+            "encode_wall_seconds": 0.18513291700000067,
+            "encode_cpu_seconds": 0.170763,
+            "encode_peak_rss_bytes": 11026432,
+            "native_decode_wall_seconds": 0.01393895800000422,
+            "native_decode_peak_rss_bytes": 2375680,
+            "rars_decode_wall_seconds": 0.013999582999996818,
+            "rars_decode_peak_rss_bytes": 4292608
+          },
+          "baseline": {
+            "archive_bytes": 35101,
+            "encode_wall_seconds": 0.1591739170000004,
+            "encode_cpu_seconds": 0.14366099999999998,
+            "encode_peak_rss_bytes": 11173888,
+            "native_decode_wall_seconds": 0.014057333000000227,
+            "native_decode_peak_rss_bytes": 2375680,
+            "rars_decode_wall_seconds": 0.013859290999999274,
+            "rars_decode_peak_rss_bytes": 4292608
+          },
+          "native": {
+            "archive_bytes": 38718,
+            "encode_wall_seconds": 0.01432320800000042,
+            "encode_cpu_seconds": 0.009613,
+            "encode_peak_rss_bytes": 18366464,
+            "native_decode_wall_seconds": 0.013950750000002898,
+            "native_decode_peak_rss_bytes": 2375680,
+            "rars_decode_wall_seconds": 0.014417125000001363,
+            "rars_decode_peak_rss_bytes": 4259840
+          },
+          "paired_wall_median_ratio": 1.17194715138459,
+          "paired_wall_median_bootstrap_95pct": [
+            1.1189439513917276,
+            1.236854154262552
+          ],
+          "paired_wall_ratios": [
+            1.113951205438111,
+            1.2305451123747317,
+            1.2654521402224068,
+            1.1867279194798022,
+            1.17194715138459,
+            1.1189439513917276,
+            1.07649932759736,
+            1.1257806055149326,
+            1.236854154262552,
+            1.0765719365745257,
+            1.1520137252602118,
+            1.1728060006213321,
+            1.29795494452239,
+            1.1248348171042923,
+            1.2368678579340053
+          ],
+          "paired_peak_rss_median_ratio": 0.9853157121879589,
+          "archive_size_ratio": 1.0105979886612917,
+          "deterministic_candidate_archive_sha256": "51561442d239b452f63f448065afbd314afaee95d578c1e4c7e33cd5adc0ccce"
+        },
+        "related-releases": {
+          "candidate": {
+            "archive_bytes": 1404,
+            "encode_wall_seconds": 0.026835708000000125,
+            "encode_cpu_seconds": 0.011382,
+            "encode_peak_rss_bytes": 6406144,
+            "native_decode_wall_seconds": 0.013462415999999422,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.014361499999999694,
+            "rars_decode_peak_rss_bytes": 3653632
+          },
+          "baseline": {
+            "archive_bytes": 1403,
+            "encode_wall_seconds": 0.026191875000002085,
+            "encode_cpu_seconds": 0.007897,
+            "encode_peak_rss_bytes": 6340608,
+            "native_decode_wall_seconds": 0.014337041000000994,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.014479875000000142,
+            "rars_decode_peak_rss_bytes": 3653632
+          },
+          "native": {
+            "archive_bytes": 1628,
+            "encode_wall_seconds": 0.014197584000001484,
+            "encode_cpu_seconds": 0.004176,
+            "encode_peak_rss_bytes": 9601024,
+            "native_decode_wall_seconds": 0.014090457999998307,
+            "native_decode_peak_rss_bytes": 2129920,
+            "rars_decode_wall_seconds": 0.014630832999998233,
+            "rars_decode_peak_rss_bytes": 3653632
+          },
+          "paired_wall_median_ratio": 1.0302917359077035,
+          "paired_wall_median_bootstrap_95pct": [
+            0.9852128946033158,
+            1.0748245748402776
+          ],
+          "paired_wall_ratios": [
+            1.084940260685976,
+            0.9211007316112683,
+            1.085479387487847,
+            0.9940427212585385,
+            0.9895023859358218,
+            0.9852128946033158,
+            1.0302917359077035,
+            1.0580030257473967,
+            0.9965672467329694,
+            1.0580448563726217,
+            0.9733368766468548,
+            1.0748245748402776,
+            0.9306525026545196,
+            1.0578713812478961,
+            1.776124922793381
+          ],
+          "paired_peak_rss_median_ratio": 1.0128865979381443,
+          "archive_size_ratio": 1.000712758374911,
+          "deterministic_candidate_archive_sha256": "7789aacba7f58b352dc5e98ccf2f2b30b954a043a467b7e1d3dc196739a9032f"
+        },
+        "shifted-repeat": {
+          "candidate": {
+            "archive_bytes": 8650,
+            "encode_wall_seconds": 0.014394916000000535,
+            "encode_cpu_seconds": 0.00407,
+            "encode_peak_rss_bytes": 6684672,
+            "native_decode_wall_seconds": 0.014074499999999546,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.013184916999996688,
+            "rars_decode_peak_rss_bytes": 3653632
+          },
+          "baseline": {
+            "archive_bytes": 8650,
+            "encode_wall_seconds": 0.014339416999998633,
+            "encode_cpu_seconds": 0.003629,
+            "encode_peak_rss_bytes": 6553600,
+            "native_decode_wall_seconds": 0.014050957999998559,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.014322082999999708,
+            "rars_decode_peak_rss_bytes": 3670016
+          },
+          "native": {
+            "archive_bytes": 8671,
+            "encode_wall_seconds": 0.014457833000001585,
+            "encode_cpu_seconds": 0.004831,
+            "encode_peak_rss_bytes": 9682944,
+            "native_decode_wall_seconds": 0.014258208999999411,
+            "native_decode_peak_rss_bytes": 2146304,
+            "rars_decode_wall_seconds": 0.014186958000001582,
+            "rars_decode_peak_rss_bytes": 3670016
+          },
+          "paired_wall_median_ratio": 1.0325270488858336,
+          "paired_wall_median_bootstrap_95pct": [
+            1.0089586757517406,
+            1.0661624655066195
+          ],
+          "paired_wall_ratios": [
+            1.0325270488858336,
+            1.0377793461661307,
+            1.1085804665875267,
+            1.0089586757517406,
+            1.8734004262379294,
+            1.0457587101578143,
+            0.926397490115413,
+            1.7347869163719678,
+            1.7951840607009253,
+            1.0661624655066195,
+            1.0178660397038328,
+            0.9682382782595222,
+            0.9780411815604829,
+            1.0124040368309468,
+            0.8894743238084774
+          ],
+          "paired_peak_rss_median_ratio": 1.0199501246882794,
+          "archive_size_ratio": 1.0,
+          "deterministic_candidate_archive_sha256": "c8a5d9b95fb146541c56f701b173294613629c63fc84ff97a098cb55ba19f40b"
+        },
+        "dictionary-distance": {
+          "candidate": {
+            "archive_bytes": 172332,
+            "encode_wall_seconds": 0.026966666999999944,
+            "encode_cpu_seconds": 0.016156999999999998,
+            "encode_peak_rss_bytes": 16416768,
+            "native_decode_wall_seconds": 0.014007166999999043,
+            "native_decode_peak_rss_bytes": 2293760,
+            "rars_decode_wall_seconds": 0.013699000000000794,
+            "rars_decode_peak_rss_bytes": 4210688
+          },
+          "baseline": {
+            "archive_bytes": 172331,
+            "encode_wall_seconds": 0.026676416999997343,
+            "encode_cpu_seconds": 0.014077999999999999,
+            "encode_peak_rss_bytes": 16203776,
+            "native_decode_wall_seconds": 0.014107041999999126,
+            "native_decode_peak_rss_bytes": 2293760,
+            "rars_decode_wall_seconds": 0.014019957999998667,
+            "rars_decode_peak_rss_bytes": 4210688
+          },
+          "native": {
+            "archive_bytes": 172648,
+            "encode_wall_seconds": 0.014389582999999817,
+            "encode_cpu_seconds": 0.008959,
+            "encode_peak_rss_bytes": 16220160,
+            "native_decode_wall_seconds": 0.014169165999998512,
+            "native_decode_peak_rss_bytes": 2293760,
+            "rars_decode_wall_seconds": 0.014201958000001014,
+            "rars_decode_peak_rss_bytes": 4276224
+          },
+          "paired_wall_median_ratio": 1.0624548851002347,
+          "paired_wall_median_bootstrap_95pct": [
+            0.999458707083149,
+            1.096653640035953
+          ],
+          "paired_wall_ratios": [
+            1.0046855185091461,
+            1.096653640035953,
+            0.999458707083149,
+            0.9271062029162064,
+            1.0549288040943925,
+            0.995937380256614,
+            1.0784475303991845,
+            1.4725735688516437,
+            0.989051965095132,
+            1.0624548851002347,
+            2.369109967130701,
+            1.126506383198338,
+            1.0631029210870275,
+            1.5916715714889804,
+            0.9232452394190427
+          ],
+          "paired_peak_rss_median_ratio": 1.0141557128412537,
+          "archive_size_ratio": 1.000005802786498,
+          "deterministic_candidate_archive_sha256": "446fad78c3d83c94e88a83aa03ca568eabd6e4e0d15db40fb66132ee16dcf2c3"
+        },
+        "unrelated-data": {
+          "candidate": {
+            "archive_bytes": 24733,
+            "encode_wall_seconds": 0.014488624999998478,
+            "encode_cpu_seconds": 0.00541,
+            "encode_peak_rss_bytes": 8667136,
+            "native_decode_wall_seconds": 0.014318666999997731,
+            "native_decode_peak_rss_bytes": 6307840,
+            "rars_decode_wall_seconds": 0.014382499999996412,
+            "rars_decode_peak_rss_bytes": 3473408
+          },
+          "baseline": {
+            "archive_bytes": 24733,
+            "encode_wall_seconds": 0.014622666000001061,
+            "encode_cpu_seconds": 0.004553,
+            "encode_peak_rss_bytes": 8536064,
+            "native_decode_wall_seconds": 0.013866166999999763,
+            "native_decode_peak_rss_bytes": 6307840,
+            "rars_decode_wall_seconds": 0.01429333300000124,
+            "rars_decode_peak_rss_bytes": 3473408
+          },
+          "native": {
+            "archive_bytes": 24731,
+            "encode_wall_seconds": 0.014505665999999806,
+            "encode_cpu_seconds": 0.005308,
+            "encode_peak_rss_bytes": 10010624,
+            "native_decode_wall_seconds": 0.014637708000002192,
+            "native_decode_peak_rss_bytes": 6307840,
+            "rars_decode_wall_seconds": 0.01465675000000033,
+            "rars_decode_peak_rss_bytes": 3473408
+          },
+          "paired_wall_median_ratio": 0.9863114298099764,
+          "paired_wall_median_bootstrap_95pct": [
+            0.5723991776187365,
+            1.0895643840954456
+          ],
+          "paired_wall_ratios": [
+            0.9988433418788303,
+            0.9863114298099764,
+            0.5723991776187365,
+            1.1582339846664527,
+            0.5484556152637956,
+            0.5681246766505978,
+            0.5300702186409888,
+            0.9886478293353915,
+            1.9043537157664732,
+            0.5358933377946864,
+            1.098288543712059,
+            1.0543966050985332,
+            0.9812057144884558,
+            1.0895643840954456,
+            0.9774559325567098
+          ],
+          "paired_peak_rss_median_ratio": 1.0134357005758157,
+          "archive_size_ratio": 1.0,
+          "deterministic_candidate_archive_sha256": "3d229dba0ebaea9f7899b08cde8af2c54b5dbc35586b4d7d82e261b0df4510f0"
+        },
+        "hot-prefix-pressure": {
+          "candidate": {
+            "archive_bytes": 192798,
+            "encode_wall_seconds": 0.03704770800000112,
+            "encode_cpu_seconds": 0.018548,
+            "encode_peak_rss_bytes": 16580608,
+            "native_decode_wall_seconds": 0.013843167000000989,
+            "native_decode_peak_rss_bytes": 2310144,
+            "rars_decode_wall_seconds": 0.014064167000000793,
+            "rars_decode_peak_rss_bytes": 4259840
+          },
+          "baseline": {
+            "archive_bytes": 192801,
+            "encode_wall_seconds": 0.027182665999999855,
+            "encode_cpu_seconds": 0.016714,
+            "encode_peak_rss_bytes": 16203776,
+            "native_decode_wall_seconds": 0.014040832999999253,
+            "native_decode_peak_rss_bytes": 2310144,
+            "rars_decode_wall_seconds": 0.014271208000000257,
+            "rars_decode_peak_rss_bytes": 4259840
+          },
+          "native": {
+            "archive_bytes": 193708,
+            "encode_wall_seconds": 0.014395957999999709,
+            "encode_cpu_seconds": 0.009996999999999999,
+            "encode_peak_rss_bytes": 16334848,
+            "native_decode_wall_seconds": 0.01394704200000163,
+            "native_decode_peak_rss_bytes": 2310144,
+            "rars_decode_wall_seconds": 0.014311375000000126,
+            "rars_decode_peak_rss_bytes": 4308992
+          },
+          "paired_wall_median_ratio": 1.081408627181275,
+          "paired_wall_median_bootstrap_95pct": [
+            1.029548351067922,
+            1.431996791110305
+          ],
+          "paired_wall_ratios": [
+            0.7032277061161478,
+            1.3959279049376139,
+            0.9915722794875707,
+            1.4902562586791386,
+            1.290913399045417,
+            1.4643433777776738,
+            1.0505298491023176,
+            1.029548351067922,
+            0.9547458987114816,
+            1.4305634412465154,
+            1.081408627181275,
+            0.7281974935698086,
+            1.045535861204338,
+            1.431996791110305,
+            1.4861970827171276
+          ],
+          "paired_peak_rss_median_ratio": 1.0232558139534884,
+          "archive_size_ratio": 0.9999844399147307,
+          "deterministic_candidate_archive_sha256": "11c5376e5188e9b061c287054641630dfd2b7c190f0655d21224cd5530142bb9"
+        }
+      }
+    }
+  },
+  "verification": {
+    "cyclic": {
+      "verified_tasks": 102,
+      "candidate_archives_native_extracted": 102,
+      "all_role_archives_native_extracted": 306,
+      "all_role_archives_rars_extracted": 306,
+      "coverage": "six screen tasks, six warmups, ninety measured confirmation tasks",
+      "contents_paths_mode_mtime": "pass",
+      "deterministic_candidate_archives": true
+    },
+    "useful": {
+      "verified_tasks": 102,
+      "candidate_archives_native_extracted": 102,
+      "all_role_archives_native_extracted": 306,
+      "all_role_archives_rars_extracted": 306,
+      "coverage": "six screen tasks, six warmups, ninety measured confirmation tasks",
+      "contents_paths_mode_mtime": "pass",
+      "deterministic_candidate_archives": true
+    }
+  },
+  "native_rar": {
+    "version": "7.23 macOS ARM64",
+    "download_url": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz",
+    "executable_sha256": "fd6c7db73c659a28b50408354f4a4845c53a67f929f37fd99df92aa77b9f5153"
+  },
+  "host": {
+    "cpu": "Apple M3 Pro",
+    "logical_cpus": 12,
+    "physical_memory_bytes": 38654705664,
+    "os": "macOS 26.6.2 ARM64"
+  },
+  "protocol": {
+    "seed": 20261017,
+    "format": "RAR5",
+    "memory_limit_bytes": 268435456,
+    "serial_variants": true,
+    "serial_timed_jobs": true,
+    "cold_cache_preparation": false,
+    "wall_scope": "complete CLI process, including startup and file I/O",
+    "bootstrap": "5000 resampled medians; deterministic SHA256(variant + workload) seed; exploratory per-workload 95% intervals, no multiple-comparison adjustment"
+  }
+}
