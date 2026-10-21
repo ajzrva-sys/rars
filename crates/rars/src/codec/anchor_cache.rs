@@ -152,6 +152,10 @@ impl<B: Budget> AnchorMatchFinder<B> {
         pos: usize,
         max_distance: usize,
     ) -> ([usize; WAYS], usize) {
+        // Optimal BlockMatches stores distances in u32. Source coordinates can
+        // exceed four GiB, but admitting a wider distance would truncate it in
+        // that representation before the parser emits the match.
+        let max_distance = max_distance.min(u32::MAX as usize);
         let mut ordered = [0usize; WAYS];
         let mut count = 0;
         for way in 0..WAYS {
@@ -436,9 +440,10 @@ mod tests {
         let Some(position) = (u32::MAX as usize).checked_add(123) else {
             return;
         };
-        let mut finder = finder(2 * RECENT_LIMIT, AnchorPolicy::Cyclic);
+        let mut finder = finder(usize::MAX, AnchorPolicy::Cyclic);
+        finder.remember(0, 0, position + RECENT_LIMIT);
         finder.remember(0, position, position + RECENT_LIMIT);
-        let (ordered, count) = finder.ordered_anchors(0, position + RECENT_LIMIT, RECENT_LIMIT);
+        let (ordered, count) = finder.ordered_anchors(0, position + RECENT_LIMIT, usize::MAX);
         assert_eq!(count, 1);
         assert_eq!(finder.anchors[ordered[0]].position, position);
     }
