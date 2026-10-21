@@ -9,7 +9,7 @@
 //! window. Inserting costs one store, so a caller can skip past bytes it has
 //! already decided about for free, which is what the lazy encoders do.
 //!
-//! [`TreeMatchFinder`] keeps the positions sharing a hash in a binary tree
+//! `TreeMatchFinder` keeps the positions sharing a hash in a binary tree
 //! ordered by the bytes that follow them, after LZMA. One descent finds every
 //! improving match and re-hangs the tree under the new position, and each node
 //! on the way down narrows a proven-prefix bound, so the descent never re-reads
@@ -115,7 +115,13 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         })
     }
 
-    #[cfg(feature = "write")]
+    #[cfg(all(
+        feature = "write",
+        not(any(
+            feature = "experimental-anchor-cyclic",
+            feature = "experimental-anchor-useful"
+        ))
+    ))]
     pub(crate) fn allowance(&self) -> B {
         self.head.allowance()
     }
@@ -173,6 +179,13 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
 /// with the chain finder's `prev`, and the same rules keep slot reuse and the
 /// window from ever overlapping. Truncated links are read back with the
 /// position being searched for as the reference, which is always the newest.
+#[cfg(any(
+    test,
+    not(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    ))
+))]
 #[derive(Debug)]
 pub(crate) struct TreeMatchFinder<B: Budget = Allowance> {
     head: Buffer<u32, B>,
@@ -182,6 +195,13 @@ pub(crate) struct TreeMatchFinder<B: Budget = Allowance> {
     mask: usize,
 }
 
+#[cfg(any(
+    test,
+    not(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    ))
+))]
 impl TreeMatchFinder {
     #[cfg(test)]
     pub(crate) fn new(window: usize) -> Self {
@@ -189,6 +209,13 @@ impl TreeMatchFinder {
     }
 }
 
+#[cfg(any(
+    test,
+    not(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    ))
+))]
 impl<B: Budget> TreeMatchFinder<B> {
     const HASH_BITS: u32 = 17;
     const MIN_MATCH: usize = 4;
@@ -217,7 +244,13 @@ impl<B: Budget> TreeMatchFinder<B> {
         })
     }
 
-    #[cfg(feature = "write")]
+    #[cfg(all(
+        feature = "write",
+        not(any(
+            feature = "experimental-anchor-cyclic",
+            feature = "experimental-anchor-useful"
+        ))
+    ))]
     pub(crate) fn allowance(&self) -> B {
         self.head.allowance()
     }

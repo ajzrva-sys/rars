@@ -21,6 +21,10 @@ all-features = true
 [features]
 # Default builds retain all capabilities; each optional feature is independent.
 default = ["write", "parallel", "recovery", "encryption"]
+# Candidate-discovery experiments; neither changes the default encoder.
+# Enabling both selects usefulness retention deterministically.
+experimental-anchor-cyclic = ["write"]
+experimental-anchor-useful = ["write"]
 parallel = ["dep:rayon"]
 recovery = ["dep:getrandom"]
 write = ["dep:getrandom"]

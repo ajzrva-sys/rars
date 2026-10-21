@@ -516,9 +516,15 @@ fn large_member_search_setup_failures_release_the_allowance() {
 fn optimal_parse_pass_failures_release_the_allowance() {
     let data: Vec<u8> = (0..512).map(|i| (i * 71) as u8).collect();
     let options = EncodeOptions::new(16).with_optimal_parse(true);
-    // The first limit fails while building the initial optimal path; the
-    // second permits that path but fails while repricing it.
-    for limit in [1_080_000, 1_105_000] {
+    // Account for the selected finder's storage separately: the experimental
+    // caches reserve less than the default tree. These remaining allowances
+    // fail while building the first path and while repricing, respectively.
+    let probe = Allowance::limited(u64::MAX);
+    let collector = OptimalCollector::with_allowance(&data, 0, options, &probe).unwrap();
+    let finder_bytes = probe.used();
+    drop(collector);
+    assert_eq!(probe.used(), 0);
+    for limit in [finder_bytes + 31_424, finder_bytes + 56_424] {
         let allowance = Allowance::limited(limit);
         assert!(matches!(
             encode_member_with_allowance(&data, &[], 0, options, None, &allowance),
@@ -1654,7 +1660,7 @@ fn collected_optimal_tokens(
 fn should_lazy_emit_literal(
     input: &[u8],
     pos: usize,
-    finder: &Rar50MatchFinder,
+    finder: &mut Rar50MatchFinder,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -2407,7 +2413,7 @@ fn cost_aware_match_selection_prefers_repeat_distance_token() {
     input[pos..pos + 8].copy_from_slice(pattern);
     input[pos + 8] = b'X';
 
-    let mut finder = Rar50MatchFinder::new(input.len());
+    let mut finder = test_match_finder(input.len());
     for candidate in 0..pos {
         finder.insert(&input, candidate);
     }
@@ -2420,7 +2426,7 @@ fn cost_aware_match_selection_prefers_repeat_distance_token() {
         &input,
         pos,
         input.len(),
-        &finder,
+        &mut finder,
         EncodeOptions::default(),
         &state,
         DISTANCE_TABLE_SIZE_50,
@@ -2442,7 +2448,7 @@ fn lazy_parser_uses_match_cost_not_only_match_length() {
     input[pos - 30] = b'x';
     input[pos..pos + 9].copy_from_slice(b"ABCDEFGHI");
 
-    let mut finder = Rar50MatchFinder::new(input.len());
+    let mut finder = test_match_finder(input.len());
     for candidate in 0..pos {
         finder.insert(&input, candidate);
     }
@@ -2454,7 +2460,7 @@ fn lazy_parser_uses_match_cost_not_only_match_length() {
         &input,
         pos,
         input.len(),
-        &finder,
+        &mut finder,
         EncodeOptions::default(),
         &state,
         DISTANCE_TABLE_SIZE_50,
@@ -2465,7 +2471,7 @@ fn lazy_parser_uses_match_cost_not_only_match_length() {
     assert!(should_lazy_emit_literal(
         &input,
         pos,
-        &finder,
+        &mut finder,
         EncodeOptions::default().with_lazy_matching(true),
         &state,
         DISTANCE_TABLE_SIZE_50,
@@ -2483,7 +2489,7 @@ fn lazy_parser_uses_bounded_cost_lookahead() {
     input[pos - 80..pos - 70].copy_from_slice(b"CDEFGHIJKL");
     input[pos..pos + 12].copy_from_slice(b"ABCDEFGHIJKL");
 
-    let mut finder = Rar50MatchFinder::new(input.len());
+    let mut finder = test_match_finder(input.len());
     for candidate in 0..pos {
         finder.insert(&input, candidate);
     }
@@ -2492,7 +2498,7 @@ fn lazy_parser_uses_bounded_cost_lookahead() {
         &input,
         pos,
         input.len(),
-        &finder,
+        &mut finder,
         EncodeOptions::default(),
         &state,
         DISTANCE_TABLE_SIZE_50,
@@ -2503,7 +2509,7 @@ fn lazy_parser_uses_bounded_cost_lookahead() {
     assert!(!should_lazy_emit_literal(
         &input,
         pos,
-        &finder,
+        &mut finder,
         EncodeOptions::default()
             .with_lazy_matching(true)
             .with_lazy_lookahead(1),
@@ -2514,7 +2520,7 @@ fn lazy_parser_uses_bounded_cost_lookahead() {
     assert!(should_lazy_emit_literal(
         &input,
         pos,
-        &finder,
+        &mut finder,
         EncodeOptions::default()
             .with_lazy_matching(true)
             .with_lazy_lookahead(2),
@@ -2534,7 +2540,7 @@ fn lazy_parser_charges_for_skipped_literals() {
     input[pos - 80..pos - 71].copy_from_slice(b"CDEFGHIJK");
     input[pos..pos + 12].copy_from_slice(b"ABCDEFGHIJKL");
 
-    let mut finder = Rar50MatchFinder::new(input.len());
+    let mut finder = test_match_finder(input.len());
     for candidate in 0..pos {
         finder.insert(&input, candidate);
     }
@@ -2543,7 +2549,7 @@ fn lazy_parser_charges_for_skipped_literals() {
         &input,
         pos,
         input.len(),
-        &finder,
+        &mut finder,
         EncodeOptions::default(),
         &state,
         DISTANCE_TABLE_SIZE_50,
@@ -2554,7 +2560,7 @@ fn lazy_parser_charges_for_skipped_literals() {
         &input,
         pos + 2,
         input.len(),
-        &finder,
+        &mut finder,
         EncodeOptions::default(),
         &state,
         DISTANCE_TABLE_SIZE_50,
@@ -2566,7 +2572,7 @@ fn lazy_parser_charges_for_skipped_literals() {
     assert!(!should_lazy_emit_literal(
         &input,
         pos,
-        &finder,
+        &mut finder,
         EncodeOptions::default()
             .with_lazy_matching(true)
             .with_lazy_lookahead(2),
@@ -2579,7 +2585,7 @@ fn lazy_parser_charges_for_skipped_literals() {
 #[test]
 fn lazy_match_lookahead_stops_at_the_member_boundary() {
     let input = b"abcdef";
-    let mut finder = Rar50MatchFinder::new(input.len());
+    let mut finder = test_match_finder(input.len());
     for pos in 0..4 {
         finder.insert(input, pos);
     }
@@ -2594,7 +2600,7 @@ fn lazy_match_lookahead_stops_at_the_member_boundary() {
             input,
             4,
             input.len(),
-            &finder,
+            &mut finder,
             EncodeOptions::default()
                 .with_lazy_matching(true)
                 .with_lazy_lookahead(4),
@@ -6042,4 +6048,48 @@ fn filter_stage_frees_a_place_in_a_full_queue_once_a_filter_is_applied() {
     stage
         .hold::<std::convert::Infallible>(pending(FilterType::E8, MAX_STREAMED_FILTERS * 16, 8))
         .unwrap();
+}
+
+#[cfg(any(
+    feature = "experimental-anchor-cyclic",
+    feature = "experimental-anchor-useful"
+))]
+#[test]
+fn anchor_cache_encodes_old_repeats_and_round_trips_both_versions_and_parsers() {
+    let mut seed = 0x19ad_f623u32;
+    let mut input: Vec<u8> = (0..128 * 1024 + 17)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    input.extend_from_within(0..4096);
+    for optimal in [false, true] {
+        let options = EncodeOptions::new(64)
+            .with_optimal_parse(optimal)
+            .with_max_match_distance(256 * 1024);
+        for version in [0, 1] {
+            let distance_size = if version == 0 {
+                DISTANCE_TABLE_SIZE_50
+            } else {
+                DISTANCE_TABLE_SIZE_70
+            };
+            let tokens = encode_tokens_with_progress(
+                &input,
+                0..input.len(),
+                MemberSearch::Fresh,
+                options,
+                distance_size,
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(tokens.iter().any(|token| matches!(
+                token,
+                EncodeToken::Match { length, distance } if *length >= 256 && *distance > 64 * 1024
+            )), "the aged anchor was not used: optimal={optimal}, version={version}");
+            let packed = encode_lz_member_with_options(&input, version, options).unwrap();
+            assert_eq!(decode_lz(&packed, version, input.len()).unwrap(), input);
+        }
+    }
 }

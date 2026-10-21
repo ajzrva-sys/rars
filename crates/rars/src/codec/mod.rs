@@ -1,5 +1,13 @@
 //! RAR compression codecs, filters, PPMd, and RARVM components used by `rars`.
 
+#[cfg(all(
+    any(test, feature = "write"),
+    any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    )
+))]
+mod anchor_cache;
 mod canonical;
 pub(crate) mod fast;
 pub(crate) mod filters;

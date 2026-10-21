@@ -1,12 +1,58 @@
 //! RAR5/7 LZ encoding, block selection, token pricing and table emission.
-use super::super::{huffman, match_finder};
+#[cfg(any(
+    feature = "experimental-anchor-cyclic",
+    feature = "experimental-anchor-useful"
+))]
+use super::super::anchor_cache::{AnchorMatchFinder, AnchorPolicy};
+use super::super::huffman;
+#[cfg(not(any(
+    feature = "experimental-anchor-cyclic",
+    feature = "experimental-anchor-useful"
+)))]
+use super::super::match_finder;
 use super::*;
 #[cfg(test)]
 use std::io::Write;
 
 /// Matches shorter than 4 bytes are never emitted, so candidate positions are
 /// chained by a hash of their first 4 bytes.
+#[cfg(not(any(
+    feature = "experimental-anchor-cyclic",
+    feature = "experimental-anchor-useful"
+)))]
 type Rar50MatchFinder<B = Allowance> = match_finder::MatchFinder<4, B>;
+#[cfg(any(
+    feature = "experimental-anchor-cyclic",
+    feature = "experimental-anchor-useful"
+))]
+type Rar50MatchFinder<B = Allowance> = AnchorMatchFinder<B>;
+
+/// Build-time experiments replace candidate discovery only. Useful retention
+/// wins when both experimental features are enabled, including all-features.
+fn new_match_finder<B: Budget>(window: usize, allowance: &B) -> Result<Rar50MatchFinder<B>> {
+    #[cfg(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    ))]
+    {
+        let policy = if cfg!(feature = "experimental-anchor-useful") {
+            AnchorPolicy::Useful
+        } else {
+            AnchorPolicy::Cyclic
+        };
+        AnchorMatchFinder::with_allowance(window, allowance, policy)
+    }
+    #[cfg(not(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    )))]
+    match_finder::MatchFinder::with_allowance(window, allowance)
+}
+
+#[cfg(test)]
+fn test_match_finder(window: usize) -> Rar50MatchFinder {
+    new_match_finder(window, &Allowance::default()).expect("unlimited finder allocation")
+}
 
 const MAX_ENCODER_MATCH_OFFSET: usize = DEFAULT_DICTIONARY_SIZE;
 
@@ -1196,8 +1242,7 @@ fn member_finder_with_allowance<B: Budget>(
     options: EncodeOptions,
     allowance: &B,
 ) -> Result<Rar50MatchFinder<B>> {
-    let mut finder =
-        Rar50MatchFinder::with_allowance(finder_window(options, combined.len()), allowance)?;
+    let mut finder = new_match_finder(finder_window(options, combined.len()), allowance)?;
     for pos in 0..start {
         finder.insert(combined, pos);
     }
@@ -1216,8 +1261,7 @@ fn seeded_finder<B: Budget>(
     // so the first blocks of a member do not clear a window the data is not yet
     // long enough to fill.
     let behind = block.start.min(options.max_match_distance);
-    let mut finder =
-        Rar50MatchFinder::with_allowance(behind + (block.end - block.start), allowance)?;
+    let mut finder = new_match_finder(behind + (block.end - block.start), allowance)?;
     for pos in block.start - behind..block.start {
         finder.insert(combined, pos);
     }
@@ -1288,6 +1332,10 @@ struct OptimalCollector<B: Budget = Allowance> {
 }
 
 enum CollectorFinder<B: Budget = Allowance> {
+    #[cfg(not(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    )))]
     Tree(match_finder::TreeMatchFinder<B>),
     Chains(Rar50MatchFinder<B>),
 }
@@ -1307,6 +1355,17 @@ impl<B: Budget> OptimalCollector<B> {
         options: EncodeOptions,
         allowance: &B,
     ) -> Result<Self> {
+        #[cfg(any(
+            feature = "experimental-anchor-cyclic",
+            feature = "experimental-anchor-useful"
+        ))]
+        let finder = CollectorFinder::Chains(member_finder_with_allowance(
+            combined, start, options, allowance,
+        )?);
+        #[cfg(not(any(
+            feature = "experimental-anchor-cyclic",
+            feature = "experimental-anchor-useful"
+        )))]
         let finder = if start == 0 {
             CollectorFinder::Tree(match_finder::TreeMatchFinder::with_allowance(
                 finder_window(options, combined.len()),
@@ -1337,6 +1396,10 @@ impl<B: Budget> OptimalCollector<B> {
         options: EncodeOptions,
     ) -> Result<BlockMatches<B>> {
         let allowance = match &self.finder {
+            #[cfg(not(any(
+                feature = "experimental-anchor-cyclic",
+                feature = "experimental-anchor-useful"
+            )))]
             CollectorFinder::Tree(finder) => finder.allowance(),
             CollectorFinder::Chains(finder) => finder.allowance(),
         };
@@ -1357,6 +1420,10 @@ impl<B: Budget> OptimalCollector<B> {
             let max_distance = pos.min(options.max_match_distance);
             let before = matches.runs.len();
             match &mut self.finder {
+                #[cfg(not(any(
+                    feature = "experimental-anchor-cyclic",
+                    feature = "experimental-anchor-useful"
+                )))]
                 CollectorFinder::Tree(tree) => {
                     // Inserting into a tree is the same descent as searching
                     // it, so a position the parse steps over is stepped over
@@ -1397,38 +1464,74 @@ impl<B: Budget> OptimalCollector<B> {
                     if !searching || max_distance == 0 || max_length < 4 {
                         continue;
                     }
-                    // The chain walks nearest first, so the first distance to
-                    // reach a length is the cheapest one that can.
-                    let mut longest = 0usize;
-                    let mut checked = 0usize;
-                    let mut candidate = finder.first(combined, pos);
-                    while candidate != match_finder::NO_POSITION
-                        && longest < max_length
-                        && longest < NICE_MATCH_LENGTH
+                    #[cfg(any(
+                        feature = "experimental-anchor-cyclic",
+                        feature = "experimental-anchor-useful"
+                    ))]
                     {
-                        if candidate >= pos {
-                            candidate = finder.previous(candidate);
-                            continue;
+                        let mut longest = 0;
+                        let mut allocation_error = None;
+                        finder.search(
+                            combined,
+                            pos,
+                            max_length,
+                            max_distance,
+                            options.max_match_candidates,
+                            |length, distance| {
+                                if length > longest {
+                                    if let Err(error) =
+                                        matches.runs.push((length as u32, distance as u32))
+                                    {
+                                        allocation_error = Some(error);
+                                        return false;
+                                    }
+                                    longest = length;
+                                }
+                                longest < max_length && longest < NICE_MATCH_LENGTH
+                            },
+                        );
+                        if let Some(error) = allocation_error {
+                            return Err(error.into());
                         }
-                        let distance = pos - candidate;
-                        if distance > max_distance {
-                            break;
-                        }
-                        checked += 1;
-                        if combined[candidate + longest] == combined[pos + longest] {
-                            let length = match_length(combined, pos, distance, max_length);
-                            if length > longest {
-                                matches
-                                    .runs
-                                    .push((length as u32, distance as u32))
-                                    .map_err(Into::into)?;
-                                longest = length;
+                    }
+                    #[cfg(not(any(
+                        feature = "experimental-anchor-cyclic",
+                        feature = "experimental-anchor-useful"
+                    )))]
+                    {
+                        // The chain walks nearest first, so the first distance to
+                        // reach a length is the cheapest one that can.
+                        let mut longest = 0usize;
+                        let mut checked = 0usize;
+                        let mut candidate = finder.first(combined, pos);
+                        while candidate != match_finder::NO_POSITION
+                            && longest < max_length
+                            && longest < NICE_MATCH_LENGTH
+                        {
+                            if candidate >= pos {
+                                candidate = finder.previous(candidate);
+                                continue;
                             }
+                            let distance = pos - candidate;
+                            if distance > max_distance {
+                                break;
+                            }
+                            checked += 1;
+                            if combined[candidate + longest] == combined[pos + longest] {
+                                let length = match_length(combined, pos, distance, max_length);
+                                if length > longest {
+                                    matches
+                                        .runs
+                                        .push((length as u32, distance as u32))
+                                        .map_err(Into::into)?;
+                                    longest = length;
+                                }
+                            }
+                            if checked >= options.max_match_candidates {
+                                break;
+                            }
+                            candidate = finder.previous(candidate);
                         }
-                        if checked >= options.max_match_candidates {
-                            break;
-                        }
-                        candidate = finder.previous(candidate);
                     }
                 }
             }
@@ -1524,6 +1627,10 @@ fn encode_lz_block_in_window(
         MemberSearch::Fresh => Allowance::default(),
         MemberSearch::Lazy(finder) => finder.allowance(),
         MemberSearch::Optimal(collector) => match &collector.finder {
+            #[cfg(not(any(
+                feature = "experimental-anchor-cyclic",
+                feature = "experimental-anchor-useful"
+            )))]
             CollectorFinder::Tree(finder) => finder.allowance(),
             CollectorFinder::Chains(finder) => finder.allowance(),
         },
@@ -2568,6 +2675,10 @@ fn encode_tokens_with_progress(
         MemberSearch::Fresh => Allowance::default(),
         MemberSearch::Lazy(finder) => finder.allowance().clone(),
         MemberSearch::Optimal(collector) => match &collector.finder {
+            #[cfg(not(any(
+                feature = "experimental-anchor-cyclic",
+                feature = "experimental-anchor-useful"
+            )))]
             CollectorFinder::Tree(finder) => finder.allowance().clone(),
             CollectorFinder::Chains(finder) => finder.allowance().clone(),
         },
@@ -2761,7 +2872,7 @@ fn lazy_match_decision<B: Budget>(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar50MatchFinder<B>,
+    finder: &mut Rar50MatchFinder<B>,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -2807,7 +2918,7 @@ fn best_match<B: Budget>(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar50MatchFinder<B>,
+    finder: &mut Rar50MatchFinder<B>,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -2818,6 +2929,10 @@ fn best_match<B: Budget>(
         return None;
     }
     let mut best = None;
+    #[cfg(not(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    )))]
     let mut checked = 0usize;
     for distance in state.reps {
         // Remembered matches were admitted under this same distance limit at
@@ -2833,29 +2948,50 @@ fn best_match<B: Budget>(
             return Some(best);
         }
     }
-    let mut candidate = finder.first(input, pos);
-    while candidate != match_finder::NO_POSITION {
-        let distance = pos - candidate;
-        if distance > max_distance {
-            break;
-        }
-        checked += 1;
-        // A candidate can only improve on the current best when it matches at
-        // least one byte past the best length, so probe that byte first.
-        let best_length = best.map_or(0, |best: MatchCandidate| best.length);
-        if best_length == 0 || input[candidate + best_length] == input[pos + best_length] {
-            let length = match_length(input, pos, distance, max_length);
+    #[cfg(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    ))]
+    finder.search(
+        input,
+        pos,
+        max_length,
+        max_distance,
+        options.max_match_candidates,
+        |length, distance| {
             consider_match_candidate(&mut best, state, distance_size, length, distance);
-        }
-        if let Some(best) = best {
-            if best.length == max_length || best.length >= NICE_MATCH_LENGTH {
+            !best.is_some_and(|best| best.length == max_length || best.length >= NICE_MATCH_LENGTH)
+        },
+    );
+    #[cfg(not(any(
+        feature = "experimental-anchor-cyclic",
+        feature = "experimental-anchor-useful"
+    )))]
+    {
+        let mut candidate = finder.first(input, pos);
+        while candidate != match_finder::NO_POSITION {
+            let distance = pos - candidate;
+            if distance > max_distance {
                 break;
             }
+            checked += 1;
+            // A candidate can only improve on the current best when it matches at
+            // least one byte past the best length, so probe that byte first.
+            let best_length = best.map_or(0, |best: MatchCandidate| best.length);
+            if best_length == 0 || input[candidate + best_length] == input[pos + best_length] {
+                let length = match_length(input, pos, distance, max_length);
+                consider_match_candidate(&mut best, state, distance_size, length, distance);
+            }
+            if let Some(best) = best {
+                if best.length == max_length || best.length >= NICE_MATCH_LENGTH {
+                    break;
+                }
+            }
+            if checked >= options.max_match_candidates {
+                break;
+            }
+            candidate = finder.previous(candidate);
         }
-        if checked >= options.max_match_candidates {
-            break;
-        }
-        candidate = finder.previous(candidate);
     }
     best
 }
